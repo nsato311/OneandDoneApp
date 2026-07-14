@@ -333,35 +333,100 @@ async function linkProfileToSupabase({ user, email, name }) {
 }
 
 export default function App() {
-  const [state, setState] = useState(null);
-  const [me, setMe] = useState(null);
-  const [tab, setTab] = useState("pick");
-  const [booting, setBooting] = useState(true);
-  useEffect(() => { 
-    (async () => {
-      let s = await loadStateFromSupabase();
-      if (!s) { 
-        // Fallback to local if cloud fails (for testing)
-        s = freshState(); 
-      }
-      setState(s); 
+  // Replace the top-level state initialization inside function App() { ... }
+const [state, setState] = useState({ users: {}, picks: {}, golfers: [], startedTournaments: {} });
+const [me, setMe] = useState(null);
+const [tab, setTab] = useState("pick");
+const [booting, setBooting] = useState(true);
+
+useEffect(() => {
+  if (!me) {
+    setBooting(false);
+    return;
+  }
+
+  const syncLeagueDataFromSupabase = async () => {
+    try {
+      setBooting(true);
+
+      // 1. Fetch the active 2026 Season container
+      const { data: season } = await supabase
+        .from("seasons")
+        .select("id")
+        .eq("year", 2026)
+        .single();
+
+      if (!season) throw new Error("2026 Season not initialized in database.");
+
+      // 2. Fetch all registered profiles and their 2026 season entries
+      const { data: entries } = await supabase
+        .from("season_entries")
+        .select(`
+          id,
+          profiles ( id, name, email, is_admin )
+        `)
+        .eq("season_id", season.id);
+
+      // 3. Fetch all picks currently submitted for this season
+      const { data: dbPicks } = await supabase
+        .from("picks")
+        .select(`
+          points,
+          golfer_name,
+          tournament_id,
+          entry_id,
+          tournaments ( ordinal )
+        `);
+
+      // 4. Map profiles into our working state structure
+      const usersMap = {};
+      entries.forEach(e => {
+        if (e.profiles) {
+          usersMap[e.profiles.email] = {
+            id: e.profiles.id,
+            entryId: e.id,
+            name: e.profiles.name,
+            email: e.profiles.email,
+            isAdmin: e.profiles.is_admin
+          };
+        }
+      });
+
+      // 5. Map database picks into our tiered frontend structure {"email": { "t01": { golfer, points } }}
+      const picksMap = {};
+      dbPicks.forEach(p => {
+        const userEntry = entries.find(e => e.id === p.entry_id);
+        if (userEntry && userEntry.profiles) {
+          const email = userEntry.profiles.email;
+          const tKey = `t${String(p.tournaments.ordinal).padStart(2, "0")}`;
+          
+          if (!picksMap[email]) picksMap[email] = {};
+          picksMap[email][tKey] = {
+            golfer: p.golfer_name,
+            points: p.points
+          };
+        }
+      });
+
+      // 6. Fetch canonical golfer list
+      const { data: golfersData } = await supabase.from("golfers").select("name");
+
+      setState({
+        users: usersMap,
+        picks: picksMap,
+        golfers: golfersData ? golfersData.map(g => g.name) : [],
+        startedTournaments: {} // Driven dynamically by database timestamps/locks
+      });
+
+    } catch (err) {
+      console.error("🔒 Migration Read Error:", err.message);
+    } finally {
       setBooting(false);
-    })(); 
-  }, []);
-  const update = async (next) => { setState(next); await saveState(next); };
-  if (booting) return <Shell><p style={{color:C.muted}}>Loading the clubhouse…</p></Shell>;
-  if (!me) return <Login onLogin={setMe} users={state?.users || {}} />;
-  const user = state.users[me];
-  return (
-    <Shell>
-      <Header user={user} tab={tab} setTab={setTab} onLogout={()=>setMe(null)} />
-      {tab==="pick" && <PickTab state={state} update={update} me={me} />}
-      {tab==="history" && <HistoryTab state={state} me={me} />}
-      {tab==="board" && <Leaderboard state={state} me={me} />}
-      {tab==="league" && <LeaguePicks state={state} me={me} />}
-      {tab==="admin" && <Admin state={state} update={update} />}
-    </Shell>
-  );
+    }
+  };
+
+  syncLeagueDataFromSupabase();
+}, [me]);
 }
 
 function Shell({ children }) {
@@ -532,14 +597,60 @@ function Login({ onLogin, users = {} }) {
 function usedGolfers(state,email){const mine=state.picks[email]||{};return new Set(Object.values(mine).map((p)=>p.golfer).filter(Boolean));}
 
 function PickTab({ state, update, me }) {
-  const mine=state.picks[me]||{}; const used=usedGolfers(state,me);
-  const firstOpen=SEED_TOURNAMENTS.find((t)=>!mine[t.id])||SEED_TOURNAMENTS[SEED_TOURNAMENTS.length-1];
-  const [tid,setTid]=useState(firstOpen.id); const [choice,setChoice]=useState("");
-  const t=SEED_TOURNAMENTS.find((x)=>x.id===tid); const existing=mine[tid];
-  const available=state.golfers.filter((g)=>!used.has(g)||(existing&&existing.golfer===g)).sort();
-  const submit=async()=>{ if(!choice) return;
-    const picks={...state.picks,[me]:{...mine,[tid]:{golfer:choice,points:existing?existing.points:null}}};
-    await update({...state,picks}); setChoice(""); };
+  // Access current user context from mapped states
+  const currentUserContext = state.users[me]; 
+  const mine = state.picks[me] || {}; 
+  const used = usedGolfers(state, me);
+  
+  const firstOpen = SEED_TOURNAMENTS.find((t) => !mine[t.id]) || SEED_TOURNAMENTS[SEED_TOURNAMENTS.length - 1];
+  const [tid, setTid] = useState(firstOpen.id); 
+  const [choice, setChoice] = useState("");
+  const t = SEED_TOURNAMENTS.find((x) => x.id === tid); 
+  const existing = mine[tid];
+  const available = state.golfers.filter((g) => !used.has(g) || (existing && existing.golfer === g)).sort();
+
+  const submit = async () => {
+    if (!choice || !currentUserContext) return;
+
+    try {
+      // Find the specific tournament UUID belonging to this season's schedule step
+      const ordNumber = parseInt(tid.replace("t", ""), 10);
+      const { data: tournament } = await supabase
+        .from("tournaments")
+        .select("id")
+        .eq("ordinal", ordNumber)
+        .single();
+
+      // Upsert the row directly matching this user's season entry registration record
+      const { error } = await supabase
+        .from("picks")
+        .upsert({
+          entry_id: currentUserContext.entryId,
+          tournament_id: tournament.id,
+          golfer_name: choice,
+          points: existing ? existing.points : null
+        }, { onConflict: "entry_id, tournament_id" }); // Enforces single pick entry bounds
+
+      if (error) throw error;
+
+      // Update local state smoothly so the UI updates instantly without reloading
+      const picks = {
+        ...state.picks,
+        [me]: {
+          ...mine,
+          [tid]: { golfer: choice, points: existing ? existing.points : null }
+        }
+      };
+      await update({ ...state, picks });
+      
+      setChoice("");
+      alert("🏆 Pick locked securely to Supabase!");
+
+    } catch (err) {
+      alert("❌ Failed to save pick: " + err.message);
+    }
+  };
+
   return (
     <div className="pick-grid">
       <div className="card">
