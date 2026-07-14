@@ -168,44 +168,106 @@ const C = {
   line: "#cfc6ad", muted: "#5e6b60", chip: "#eef3ec",
 };
 
-function freshState() {
-  const users = {};
-  SEED_MEMBERS.forEach((m) => {
-    users[m.email] = { name: m.name, email: m.email, password: "golf", isAdmin: m.isAdmin };
-  });
-  // deep-clone seed picks
-  const picks = {};
-  Object.keys(SEED_PICKS).forEach((em) => {
-    picks[em] = {};
-    Object.keys(SEED_PICKS[em]).forEach((tid) => {
-      picks[em][tid] = { golfer: SEED_PICKS[em][tid].golfer, points: SEED_PICKS[em][tid].points };
+// --- Supabase Data Fetching (Replaces Local State) ---
+
+async function loadStateFromSupabase(seasonYear = 2026) {
+  try {
+    // 1. Fetch the active season
+    const { data: seasonData, error: seasonErr } = await supabase
+      .from('seasons')
+      .select('id, year, status')
+      .eq('year', seasonYear)
+      .single();
+    
+    if (seasonErr) throw seasonErr;
+
+    // 2. Fetch tournaments for this season (ordered by ordinal)
+    const { data: tournamentsData, error: tErr } = await supabase
+      .from('tournaments')
+      .select('*')
+      .eq('season_id', seasonData.id)
+      .order('ordinal', { ascending: true });
+    
+    if (tErr) throw tErr;
+
+    // 3. Fetch all entries + profiles + picks for this season
+    const { data: entriesData, error: eErr } = await supabase
+      .from('season_entries')
+      .select(`
+        id,
+        profile_id,
+        status,
+        profiles ( id, name, email, is_admin ),
+        picks ( tournament_id, golfer_name, points )
+      `)
+      .eq('season_id', seasonData.id);
+
+    if (eErr) throw eErr;
+
+    // 4. Fetch the canonical golfer pool
+    const { data: golfersData, error: gErr } = await supabase
+      .from('golfers')
+      .select('name')
+      .eq('active', true)
+      .order('name', { ascending: true });
+      
+    if (gErr) throw gErr;
+
+    // --- Transform data to match the UI's expected shape ---
+    
+    const users = {};
+    const picks = {};
+    
+    entriesData.forEach(entry => {
+      const email = entry.profiles.email;
+      users[email] = { 
+        name: entry.profiles.name, 
+        email: email, 
+        isAdmin: entry.profiles.is_admin 
+      };
+      
+      picks[email] = {};
+      entry.picks.forEach(pick => {
+        // Map database UUID back to local string ID for the UI
+        const localTid = SEED_TOURNAMENTS.find(t => t.name === tournamentsData.find(dt => dt.id === pick.tournament_id)?.name)?.id;
+        if (localTid) {
+          picks[email][localTid] = { 
+            golfer: pick.golfer_name, 
+            points: pick.points 
+          };
+        }
+      });
     });
-  });
-  const golfers = Array.from(new Set([...CANONICAL_GOLFERS, ...HISTORICAL_GOLFERS])).sort();
-  // A tournament is "started" once its picks are visible to the whole league.
-  // Auto-mark any event that already has scored picks (the 14 played events),
-  // plus the US Open (t15) so the gated League-picks view is testable now.
-  const started = {};
-  SEED_TOURNAMENTS.forEach((t) => {
-    const anyScored = Object.values(picks).some((mp) => mp[t.id] && mp[t.id].points !== null);
-    if (anyScored) started[t.id] = true;
-  });
-  started["t15"] = true;
-  return { users, picks, golfers, startedTournaments: started, version: SEED_VERSION };
+
+    const golfers = golfersData.map(g => g.name);
+
+    const startedTournaments = {};
+    tournamentsData.forEach(t => {
+      const localTid = SEED_TOURNAMENTS.find(st => st.name === t.name)?.id;
+      if (localTid && (t.picks_open || t.scored)) {
+        startedTournaments[localTid] = true;
+      }
+    });
+
+    return { 
+      users, 
+      picks, 
+      golfers, 
+      startedTournaments, 
+      version: SEED_VERSION,
+      _db: { seasonId: seasonData.id, tournaments: tournamentsData, entries: entriesData } // Keep raw DB refs handy
+    };
+
+  } catch (error) {
+    console.error("Failed to load state from Supabase:", error);
+    return null;
+  }
 }
 
-async function loadState() {
-  try {
-    const res = await window.storage.get(STORAGE_KEY, true);
-    if (res && res.value) {
-      const s = JSON.parse(res.value);
-      if (s.version === SEED_VERSION) return s;
-    }
-  } catch (e) {}
-  return null;
-}
+// Stub out saveState since writes now happen directly via Supabase RPC/Inserts
 async function saveState(state) {
-  try { await window.storage.set(STORAGE_KEY, JSON.stringify(state), true); } catch (e) {}
+    // No-op for now; UI updates should be routed directly to Supabase tables.
+    console.log("Local save bypassed. Next steps: Wire UI actions directly to DB.");
 }
 
 // ---- ESPN parsing --------------------------------------------------------
@@ -275,11 +337,17 @@ export default function App() {
   const [me, setMe] = useState(null);
   const [tab, setTab] = useState("pick");
   const [booting, setBooting] = useState(true);
-  useEffect(() => { (async () => {
-    let s = await loadState();
-    if (!s) { s = freshState(); await saveState(s); }
-    setState(s); setBooting(false);
-  })(); }, []);
+  useEffect(() => { 
+    (async () => {
+      let s = await loadStateFromSupabase();
+      if (!s) { 
+        // Fallback to local if cloud fails (for testing)
+        s = freshState(); 
+      }
+      setState(s); 
+      setBooting(false);
+    })(); 
+  }, []);
   const update = async (next) => { setState(next); await saveState(next); };
   if (booting) return <Shell><p style={{color:C.muted}}>Loading the clubhouse…</p></Shell>;
   if (!me) return <Login onLogin={setMe} users={state?.users || {}} />;
