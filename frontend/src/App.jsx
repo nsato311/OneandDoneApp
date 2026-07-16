@@ -1166,49 +1166,113 @@ function MigrationTool({ state }) {
 
   const runMigration = async () => {
     setLoading(true);
-    setLogs([]);
-    log("🚀 Starting Supabase migration for the 2026 league data...");
+    setLogs([]); 
+    log("🚀 Resuming data migration for Phase 3...");
 
     try {
-      const tournamentOrdinalBySeedId = new Map(SEED_TOURNAMENTS.map((t, idx) => [t.id, idx + 1]));
-      const payload = {
-        season: { year: 2026, name: '2026 Season', status: 'active' },
-        profiles: SEED_MEMBERS.map((member) => ({
-          name: member.name,
-          email: member.email,
-          is_admin: member.isAdmin
-        })),
-        tournaments: SEED_TOURNAMENTS.map((t, idx) => ({
-          ordinal: idx + 1,
-          name: t.name,
-          course: t.course,
-          date_label: t.date,
-          espn_event_id: t.espnId || null,
-          is_major: /Masters|PGA Championship|US Open|Open Championship|Genesis/i.test(t.name),
-          picks_open: idx < 14,
-          scored: idx < 14
-        })),
-        picks: Object.entries(SEED_PICKS).flatMap(([email, pickedByTournament]) =>
-          Object.entries(pickedByTournament).flatMap(([seedTournamentId, pick]) => {
-            if (!pick || !pick.golfer) return [];
-            const ordinal = tournamentOrdinalBySeedId.get(seedTournamentId);
-            if (!ordinal) return [];
-            return [{
-              email,
-              ordinal,
+      // 1. Get Active Season
+      log("1️⃣ Verifying 2026 Season...");
+      const { data: season, error: sErr } = await supabase
+        .from('seasons')
+        .select('id')
+        .eq('year', 2026)
+        .single();
+      if (sErr) throw new Error("Season sync failed: " + sErr.message);
+
+      // 2. Map Tournaments
+      log("2️⃣ Fetching Schedule DB IDs...");
+      const { data: dbTournaments, error: tErr } = await supabase.from('tournaments').select('id, ordinal');
+      if (tErr) throw new Error("Tournaments fetch failed: " + tErr.message);
+      
+      const tourneyMap = {};
+      dbTournaments.forEach(t => tourneyMap[t.ordinal] = t.id);
+
+      // 3. Push Profiles
+      log("3️⃣ Syncing Historical Profiles...");
+      const { data: existingProfiles, error: pErr1 } = await supabase.from('profiles').select('id, email');
+      if (pErr1) throw new Error("Profile fetch failed: " + pErr1.message);
+      
+      const existingEmails = new Set(existingProfiles.map(p => p.email));
+      const newProfiles = SEED_MEMBERS.filter(m => !existingEmails.has(m.email)).map(m => ({
+        id: crypto.randomUUID(), // Temporarily generating UUIDs for migration
+        name: m.name,
+        email: m.email,
+        is_admin: m.isAdmin
+      }));
+
+      if (newProfiles.length > 0) {
+        const { error: pErr2 } = await supabase.from('profiles').insert(newProfiles);
+        if (pErr2) throw new Error("Profile upload failed: " + pErr2.message);
+      }
+
+      const { data: allProfiles, error: pErr3 } = await supabase.from('profiles').select('id, email');
+      if (pErr3) throw pErr3;
+
+      // 4. Push Season Entries
+      log("4️⃣ Registering Members to 2026 Season...");
+      const entries = allProfiles.map(p => ({
+        season_id: season.id,
+        profile_id: p.id,
+        status: 'active'
+      }));
+      
+      const { data: allEntries, error: eErr } = await supabase
+        .from('season_entries')
+        .upsert(entries, { onConflict: 'season_id, profile_id' })
+        .select('id, profile_id');
+      if (eErr) throw new Error("Entries upload failed: " + eErr.message);
+
+      const entryMap = {}; 
+      allEntries.forEach(e => {
+        const prof = allProfiles.find(p => p.id === e.profile_id);
+        if (prof) entryMap[prof.email] = e.id;
+      });
+
+      // 5. Build and Push Historical Picks
+      log("5️⃣ Formatting Historical Picks...");
+      const { data: dbGolfers, error: gErr } = await supabase.from('golfers').select('espn_id, name, aliases');
+      if (gErr) throw new Error("Golfers fetch failed: " + gErr.message);
+
+      const picksToInsert = [];
+      Object.entries(SEED_PICKS).forEach(([email, memberPicks]) => {
+        const entryId = entryMap[email];
+        if (!entryId) return;
+
+        Object.entries(memberPicks).forEach(([localTid, pick]) => {
+          if (!pick || !pick.golfer) return;
+          
+          const ordinal = parseInt(localTid.replace('t', ''), 10);
+          const dbTournamentId = tourneyMap[ordinal];
+          
+          const clean = pick.golfer.toLowerCase().trim();
+          let espnId = null;
+          const found = dbGolfers.find(g => 
+            g.name.toLowerCase().trim() === clean || 
+            (g.aliases && g.aliases.some(a => a.toLowerCase().trim() === clean))
+          );
+          if (found) espnId = found.espn_id;
+
+          if (dbTournamentId) {
+            picksToInsert.push({
+              entry_id: entryId,
+              tournament_id: dbTournamentId,
+              golfer_espn_id: espnId,
               golfer_name: pick.golfer,
-              points: pick.points ?? null
-            }];
-          })
-        )
-      };
+              points: pick.points
+            });
+          }
+        });
+      });
 
-      log("1️⃣ Sending migration payload to Supabase...");
-      const { data, error } = await supabase.rpc('import_2026_league_data', { payload });
-      if (error) throw new Error(error.message);
+      log(`6️⃣ Pushing ${picksToInsert.length} picks to Supabase...`);
+      const chunkSize = 200;
+      for (let i = 0; i < picksToInsert.length; i += chunkSize) {
+        const chunk = picksToInsert.slice(i, i + chunkSize);
+        const { error: pickErr } = await supabase.from('picks').upsert(chunk, { onConflict: 'entry_id, tournament_id' });
+        if (pickErr) throw new Error(`Picks upload failed at chunk ${i}: ` + pickErr.message);
+      }
 
-      log("✅ Migration completed: " + JSON.stringify(data));
-      log("🎉 New auth accounts can now link to this season by email.");
+      log("✅ Phase 3 Complete! League picks are successfully migrated.");
     } catch (error) {
       log("❌ " + error.message);
     }
@@ -1217,13 +1281,13 @@ function MigrationTool({ state }) {
 
   return (
     <div className="card">
-      <div className="eyebrow" style={{color: "#d94833"}}>One-Time Migration</div>
-      <h2 style={{fontSize:22,marginTop:6,marginBottom:10}}>Push Local Data to Supabase</h2>
+      <div className="eyebrow" style={{color: "#d94833"}}>Phase 3 Migration</div>
+      <h2 style={{fontSize:22,marginTop:6,marginBottom:10}}>Push Historical Picks</h2>
       <p style={{fontSize:13,color:"#666",marginTop:0}}>
-        This tool uploads the 2026 season, members, schedule, and historical picks to Supabase. When a player later creates an account with the same email, it automatically connects to their league history.
+        This pushes member profiles, season entries, and the 2026 pick history to the cloud database.
       </p>
       <button className="btn" onClick={runMigration} disabled={loading} style={{background:"#d94833"}}>
-        {loading ? "Migrating..." : "Run Database Migration"}
+        {loading ? "Migrating..." : "Run Phase 3 Migration"}
       </button>
 
       {logs.length > 0 && (
