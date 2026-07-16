@@ -718,7 +718,7 @@ function PickTab({ state, update, me }) {
       await update({ ...state, picks });
       
       setChoice("");
-      alert("🏆 Pick locked securely to Supabase!");
+      alert("✅ 801 One and Done Says Pick successfully saved");
 
     } catch (err) {
       alert("❌ Failed to save pick: " + err.message);
