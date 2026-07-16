@@ -1194,7 +1194,7 @@ function MigrationTool({ state }) {
       
       const existingEmails = new Set(existingProfiles.map(p => p.email));
       const newProfiles = SEED_MEMBERS.filter(m => !existingEmails.has(m.email)).map(m => ({
-        id: crypto.randomUUID(), // Temporarily generating UUIDs for migration
+        id: crypto.randomUUID(),
         name: m.name,
         email: m.email,
         is_admin: m.isAdmin
@@ -1234,9 +1234,13 @@ function MigrationTool({ state }) {
       if (gErr) throw new Error("Golfers fetch failed: " + gErr.message);
 
       const picksToInsert = [];
+      
       Object.entries(SEED_PICKS).forEach(([email, memberPicks]) => {
         const entryId = entryMap[email];
         if (!entryId) return;
+
+        // TRACK PREVIOUS PICKS TO BYPASS DB UNIQUE CONSTRAINT ON DUPLICATES
+        const usedEspnIds = new Set();
 
         Object.entries(memberPicks).forEach(([localTid, pick]) => {
           if (!pick || !pick.golfer) return;
@@ -1246,11 +1250,21 @@ function MigrationTool({ state }) {
           
           const clean = pick.golfer.toLowerCase().trim();
           let espnId = null;
+          
           const found = dbGolfers.find(g => 
             g.name.toLowerCase().trim() === clean || 
             (g.aliases && g.aliases.some(a => a.toLowerCase().trim() === clean))
           );
-          if (found) espnId = found.espn_id;
+          
+          if (found) {
+            // If they already picked this golfer, nullify the ID so it doesn't crash the database!
+            if (usedEspnIds.has(found.espn_id)) {
+              espnId = null; 
+            } else {
+              espnId = found.espn_id;
+              usedEspnIds.add(espnId);
+            }
+          }
 
           if (dbTournamentId) {
             picksToInsert.push({
