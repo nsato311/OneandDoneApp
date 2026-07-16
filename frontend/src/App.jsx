@@ -300,34 +300,132 @@ async function linkProfileToSupabase({ user, email, name }) {
   }
 }
 
+function freshState() {
+  const users = {};
+  SEED_MEMBERS.forEach((member) => {
+    users[member.email] = {
+      name: member.name,
+      email: member.email,
+      isAdmin: member.isAdmin
+    };
+  });
+
+  const picks = {};
+  Object.entries(SEED_PICKS).forEach(([email, pickedByTournament]) => {
+    const mapped = {};
+    Object.entries(pickedByTournament).forEach(([seedTournamentId, pick]) => {
+      if (pick && pick.golfer) {
+        mapped[seedTournamentId] = { golfer: pick.golfer, points: pick.points ?? null };
+      }
+    });
+    picks[email] = mapped;
+  });
+
+  return {
+    users,
+    picks,
+    golfers: [...CANONICAL_GOLFERS].sort(),
+    startedTournaments: {}
+  };
+}
+
 export default function App() {
-  const [state, setState] = useState(null);
+  const [state, setState] = useState(freshState());
   const [me, setMe] = useState(null);
   const [tab, setTab] = useState("pick");
   const [booting, setBooting] = useState(true);
 
-  useEffect(() => { 
+  useEffect(() => {
+    let active = true;
+
     (async () => {
-      // Fetch live data from Supabase!
+      setBooting(true);
       let s = await fetchLeagueData();
-      
-      // Fallback to local state ONLY if Supabase fails or is empty
-      if (!s) { 
+
+      if (!s) {
         console.warn("Falling back to local seed data.");
-        s = freshState(); 
+        s = freshState();
       }
-      
-      setState(s); 
-      setBooting(false);
-    })(); 
+
+      if (active) {
+        setState(s || freshState());
+        setBooting(false);
+      }
+    })();
+
+    return () => {
+      active = false;
+    };
   }, []);
 
-  const update = async (next) => { 
-    setState(next); 
-    // We removed saveState(). Supabase database mutations 
-    // will be handled directly in our components in Phase 5!
+  const update = async (next) => {
+    setState(next);
   };
-  if (booting) return <Shell><p style={{color:C.muted}}>Loading the clubhouse…</p></Shell>;
+
+  const handleLogin = (email) => {
+    setMe(email);
+    setTab("pick");
+  };
+
+  const handleLogout = () => {
+    setMe(null);
+    setTab("pick");
+    setState(freshState());
+  };
+
+  const loginUsers = useMemo(() => {
+    const merged = {};
+    Object.entries(state.users).forEach(([email, user]) => {
+      merged[String(email).trim().toLowerCase()] = { ...user };
+    });
+    SEED_MEMBERS.forEach((member) => {
+      const key = String(member.email).trim().toLowerCase();
+      merged[key] = { ...merged[key], ...member, password: "golf" };
+    });
+    return merged;
+  }, [state.users]);
+
+  if (booting) {
+    return (
+      <Shell>
+        <div className="card">
+          <div className="eyebrow">Loading clubhouse</div>
+          <h2 style={{ fontSize: 24, marginTop: 6, marginBottom: 8 }}>Syncing league data…</h2>
+          <p style={{ color: C.muted, margin: 0 }}>The app is loading the current roster and picks.</p>
+        </div>
+      </Shell>
+    );
+  }
+
+  if (!me) {
+    return (
+      <Shell>
+        <Login onLogin={handleLogin} users={loginUsers} />
+      </Shell>
+    );
+  }
+
+  const currentUser = state.users[me] || { name: me, email: me, isAdmin: false };
+
+  let content;
+  if (tab === "history") {
+    content = <HistoryTab state={state} me={me} />;
+  } else if (tab === "board") {
+    content = <Leaderboard state={state} me={me} />;
+  } else if (tab === "league") {
+    content = <LeaguePicks state={state} me={me} />;
+  } else if (tab === "admin" && currentUser.isAdmin) {
+    content = <Admin state={state} update={update} />;
+  } else {
+    content = <PickTab state={state} update={update} me={me} />;
+  }
+
+  return (
+    <Shell>
+      <Header user={currentUser} tab={tab} setTab={setTab} onLogout={handleLogout} />
+      {content}
+    </Shell>
+  );
 }
 function Shell({ children }) {
   return (
