@@ -161,6 +161,7 @@ const SEED_PICKS = {
 
 const STORAGE_KEY = "oad_league_v3";
 const SEED_VERSION = 3;
+const CURRENT_SEASON_YEAR = Number(import.meta.env.VITE_SEASON_YEAR || new Date().getFullYear());
 
 const C = {
   fairway: "#1d4d3a", fairwayDk: "#163b2c", flag: "#d94f3d",
@@ -177,7 +178,7 @@ async function fetchLeagueData() {
     const { data: season, error: sErr } = await supabase
       .from('seasons')
       .select('id')
-      .eq('year', 2026)
+      .eq('year', CURRENT_SEASON_YEAR)
       .single();
       
     if (sErr) throw sErr;
@@ -442,11 +443,11 @@ export default function App() {
   } else if (tab === "board") {
     content = <Leaderboard state={state} me={me} />;
   } else if (tab === "league") {
-    content = <LeaguePicks state={state} me={me} />;
+    content = <LeaguePicks me={me} />;
   } else if (tab === "admin" && currentUser.isAdmin) {
     content = <Admin state={state} update={update} />;
   } else {
-    content = <PickTab state={state} update={update} me={me} />;
+    content = <PickTab me={me} />;
   }
 
   return (
@@ -621,46 +622,123 @@ function Login({ onLogin, users = {} }) {
     </div>
   );
 }
-function usedGolfers(state,email){const mine=state.picks[email]||{};return new Set(Object.values(mine).map((p)=>p.golfer).filter(Boolean));}
+function PickTab({ me }) {
+  const [entry, setEntry] = useState(null);
+  const [tournaments, setTournaments] = useState([]);
+  const [golfers, setGolfers] = useState([]);
+  const [picks, setPicks] = useState({});
+  const [tid, setTid] = useState("");
+  const [choice, setChoice] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
 
-function PickTab({ state, update, me }) {
-  const mine=state.picks[me]||{}; const used=usedGolfers(state,me);
-  const firstOpen=SEED_TOURNAMENTS.find((t)=>!mine[t.id])||SEED_TOURNAMENTS[SEED_TOURNAMENTS.length-1];
-  const [tid,setTid]=useState(firstOpen.id); const [choice,setChoice]=useState("");
-  const t=SEED_TOURNAMENTS.find((x)=>x.id===tid); const existing=mine[tid];
-  const available=state.golfers.filter((g)=>!used.has(g)||(existing&&existing.golfer===g)).sort();
-  
-  const submit = async () => {
-    if (!choice) return;
+  const loadPickData = async () => {
+    setLoading(true);
+    setError("");
 
-    // 1. Maintain current app functionality (Local State)
-    const picks = { ...state.picks, [me]: { ...mine, [tid]: { golfer: choice, points: existing ? existing.points : null } } };
-    await update({ ...state, picks });
-
-    // 2. Safely push the pick to Supabase using the required entry_id
     try {
-      const { data: profile } = await supabase.from('profiles').select('id').eq('email', me).single();
-      if (profile) {
-        const { data: season } = await supabase.from('seasons').select('id').eq('year', 2026).single();
-        const { data: entry } = await supabase.from('season_entries').select('id').eq('profile_id', profile.id).eq('season_id', season.id).single();
-        
-        const ordinal = parseInt(tid.replace('t', ''), 10);
-        const { data: tourney } = await supabase.from('tournaments').select('id').eq('ordinal', ordinal).single();
+      const normalizedEmail = String(me || "").trim().toLowerCase();
+      const [{ data: profile, error: profileError }, { data: season, error: seasonError }] = await Promise.all([
+        supabase.from("profiles").select("id").eq("email", normalizedEmail).single(),
+        supabase.from("seasons").select("id").eq("year", CURRENT_SEASON_YEAR).single()
+      ]);
+      if (profileError) throw profileError;
+      if (seasonError) throw seasonError;
 
-        if (entry && tourney) {
-          await supabase.from('picks').upsert({
-            entry_id: entry.id,
-            tournament_id: tourney.id,
-            golfer_name: choice
-          }, { onConflict: 'entry_id, tournament_id' });
-        }
-      }
-    } catch (err) {
-      console.error("Supabase sync issue:", err);
+      const { data: seasonEntry, error: entryError } = await supabase
+        .from("season_entries")
+        .select("id, status")
+        .eq("profile_id", profile.id)
+        .eq("season_id", season.id)
+        .single();
+      if (entryError) throw entryError;
+      if (seasonEntry.status !== "active") throw new Error("Your league entry is not active.");
+
+      const [tournamentsResult, golfersResult, picksResult] = await Promise.all([
+        supabase
+          .from("tournaments")
+          .select("id, ordinal, name, course, date_label, scored")
+          .eq("season_id", season.id)
+          .order("ordinal"),
+        supabase.from("golfers").select("name").eq("active", true).order("name"),
+        supabase
+          .from("picks")
+          .select("tournament_id, golfer_name, points")
+          .eq("entry_id", seasonEntry.id)
+      ]);
+      if (tournamentsResult.error) throw tournamentsResult.error;
+      if (golfersResult.error) throw golfersResult.error;
+      if (picksResult.error) throw picksResult.error;
+
+      const nextPicks = {};
+      (picksResult.data || []).forEach((pick) => {
+        nextPicks[pick.tournament_id] = {
+          golfer: pick.golfer_name,
+          points: pick.points
+        };
+      });
+
+      setEntry(seasonEntry);
+      setTournaments(tournamentsResult.data || []);
+      setGolfers((golfersResult.data || []).map((golfer) => golfer.name).sort());
+      setPicks(nextPicks);
+      setTid((currentTid) =>
+        (tournamentsResult.data || []).some((tournament) => tournament.id === currentTid)
+          ? currentTid
+          : tournamentsResult.data?.[0]?.id || ""
+      );
+    } catch (loadError) {
+      console.error("Error loading pick data:", loadError);
+      setError(loadError.message || "Unable to load your pick data.");
+    } finally {
+      setLoading(false);
     }
-
-    setChoice("");
   };
+
+  useEffect(() => {
+    loadPickData();
+  }, [me]);
+
+  const used = new Set(Object.values(picks).map((pick) => pick.golfer).filter(Boolean));
+  const tournament = tournaments.find((item) => item.id === tid);
+  const existing = picks[tid];
+  const available = golfers.filter((golfer) => !used.has(golfer) || existing?.golfer === golfer);
+
+  const submit = async () => {
+    if (!choice || !entry || !tournament || saving) return;
+    setSaving(true);
+    setError("");
+
+    try {
+      const { error: saveError } = await supabase.from("picks").upsert({
+        entry_id: entry.id,
+        tournament_id: tournament.id,
+        golfer_name: choice,
+        points: existing?.points ?? null
+      }, { onConflict: "entry_id, tournament_id" });
+      if (saveError) throw saveError;
+
+      setChoice("");
+      await loadPickData();
+      alert("✅ 801 One and Done Says Pick successfully saved");
+    } catch (saveError) {
+      console.error("Error saving pick:", saveError);
+      setError(saveError.message || "Unable to save your pick.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) return <div className="card"><p style={{color:C.muted}}>Loading your pick data...</p></div>;
+  if (error) return (
+    <div className="card">
+      <div className="eyebrow">This week's pick</div>
+      <h2 style={{fontSize:24,marginTop:6,marginBottom:10}}>Unable to load picks</h2>
+      <p style={{color:C.muted,margin:0}}>{error}</p>
+    </div>
+  );
+  if (!tournament) return <div className="card"><p style={{color:C.muted}}>No tournaments are available for this season.</p></div>;
 
   return (
     <div className="pick-grid">
@@ -668,9 +746,9 @@ function PickTab({ state, update, me }) {
         <div className="eyebrow">This week's pick</div>
         <label style={{display:"block",margin:"12px 0"}}><span style={{fontSize:13,fontWeight:600}}>Tournament</span>
           <select value={tid} onChange={(e)=>{setTid(e.target.value);setChoice("");}} style={{marginTop:4}}>
-            {SEED_TOURNAMENTS.map((x,i)=>(<option key={x.id} value={x.id}>{i+1}. {x.name}{mine[x.id]?"  ✓ picked":""}</option>))}
+            {tournaments.map((item)=>(<option key={item.id} value={item.id}>{item.ordinal}. {item.name}{picks[item.id]?"  ✓ picked":""}</option>))}
           </select></label>
-        <p style={{color:C.muted,margin:"0 0 16px",fontSize:13}}>{t.course} · {t.date}</p>
+        <p style={{color:C.muted,margin:"0 0 16px",fontSize:13}}>{tournament.course} · {tournament.date_label}</p>
         {existing && (<div style={{background:C.chip,border:"1px solid "+C.line,borderRadius:10,padding:"12px 14px",marginBottom:16}}>
           Current pick: <strong>{existing.golfer||"—"}</strong>
           {existing.points!==null?<span> · {existing.points} pts awarded</span>:<span style={{color:C.muted}}> · not yet scored</span>}
@@ -680,7 +758,7 @@ function PickTab({ state, update, me }) {
             <option value="">— select —</option>
             {available.map((g)=><option key={g} value={g}>{g}</option>)}
           </select></label>
-        <button className="btn" onClick={submit} disabled={!choice||(existing&&existing.points!==null)}>{existing?"Update pick":"Lock in pick"}</button>
+        <button className="btn" onClick={submit} disabled={!choice||(existing&&existing.points!==null)||saving}>{saving?"Saving...":(existing?"Update pick":"Lock in pick")}</button>
         {existing&&existing.points!==null && <p style={{color:C.muted,fontSize:12,marginTop:10}}>This event is scored and locked. Ask a commissioner to change it.</p>}
       </div>
       <div className="card">
@@ -706,7 +784,7 @@ function HistoryTab({ me }) {
       try {
         // 1. Identify the user profile and active season
         const { data: profile } = await supabase.from('profiles').select('id').eq('email', me).single();
-        const { data: season } = await supabase.from('seasons').select('id').eq('year', 2026).single();
+        const { data: season } = await supabase.from('seasons').select('id').eq('year', CURRENT_SEASON_YEAR).single();
         
         if (profile && season) {
           // 2. Locate their specific season entry
@@ -784,7 +862,7 @@ function Leaderboard({ me }) {
       setLoading(true);
       try {
         // 1. Identify the active season
-        const { data: season } = await supabase.from('seasons').select('id').eq('year', 2026).single();
+        const { data: season } = await supabase.from('seasons').select('id').eq('year', CURRENT_SEASON_YEAR).single();
         if (!season) return;
 
         // 2. Fetch all entries, joining profile names and pick points
@@ -870,28 +948,132 @@ function isStarted(state, tid){
   return Object.values(state.picks).some((mp)=>mp[tid] && mp[tid].points!==null);
 }
 
-function LeaguePicks({ state, me }) {
-  const started = SEED_TOURNAMENTS.filter((t)=>isStarted(state, t.id));
+function LeaguePicks({ me }) {
   const [view, setView] = useState("event");
-  const [tid, setTid] = useState(started.length ? started[started.length-1].id : SEED_TOURNAMENTS[0].id);
-  const members = Object.values(state.users).sort((a,b)=>a.name.localeCompare(b.name));
+  const [tid, setTid] = useState("");
+  const [events, setEvents] = useState([]);
+  const [members, setMembers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
 
-  if (started.length === 0) {
+  useEffect(() => {
+    let active = true;
+
+    const fetchLeaguePicks = async () => {
+      setLoading(true);
+      setError("");
+
+      try {
+        const { data: season, error: seasonError } = await supabase
+          .from("seasons")
+          .select("id")
+          .eq("year", CURRENT_SEASON_YEAR)
+          .single();
+        if (seasonError) throw seasonError;
+
+        const [tournamentsResult, entriesResult] = await Promise.all([
+          supabase
+            .from("tournaments")
+            .select("id, ordinal, name, course, date_label, picks_open, scored")
+            .eq("season_id", season.id)
+            .or("picks_open.eq.true,scored.eq.true")
+            .order("ordinal"),
+          supabase
+            .from("season_entries")
+            .select(`
+              id,
+              profiles ( name, email ),
+              picks (
+                tournament_id,
+                golfer_name,
+                points,
+                tournaments ( id, ordinal, name, course, date_label, picks_open, scored )
+              )
+            `)
+            .eq("season_id", season.id)
+            .eq("status", "active")
+        ]);
+
+        if (tournamentsResult.error) throw tournamentsResult.error;
+        if (entriesResult.error) throw entriesResult.error;
+
+        const visibleEvents = (tournamentsResult.data || []).filter(
+          (tournament) => tournament.picks_open || tournament.scored
+        );
+        const visibleIds = new Set(visibleEvents.map((tournament) => tournament.id));
+        const visibleMembers = (entriesResult.data || [])
+          .map((entry) => {
+            const profile = Array.isArray(entry.profiles) ? entry.profiles[0] : entry.profiles;
+            const email = String(profile?.email || "").trim().toLowerCase();
+            if (!email) return null;
+
+            const picks = {};
+            (entry.picks || []).forEach((pick) => {
+              if (visibleIds.has(pick.tournament_id)) {
+                picks[pick.tournament_id] = {
+                  golfer: pick.golfer_name,
+                  points: pick.points
+                };
+              }
+            });
+
+            return {
+              name: profile.name || email,
+              email,
+              picks
+            };
+          })
+          .filter(Boolean)
+          .sort((a, b) => a.name.localeCompare(b.name));
+
+        if (!active) return;
+        setEvents(visibleEvents);
+        setMembers(visibleMembers);
+        setTid((currentTid) =>
+          visibleEvents.some((event) => event.id === currentTid)
+            ? currentTid
+            : visibleEvents[visibleEvents.length - 1]?.id || ""
+        );
+      } catch (fetchError) {
+        console.error("Error fetching league picks:", fetchError);
+        if (active) setError(fetchError.message || "Unable to load league picks.");
+      } finally {
+        if (active) setLoading(false);
+      }
+    };
+
+    fetchLeaguePicks();
+    return () => {
+      active = false;
+    };
+  }, [me]);
+
+  if (loading) return <div className="card"><p style={{color:C.muted}}>Loading league picks...</p></div>;
+
+  if (error) return (
+    <div className="card">
+      <div className="eyebrow">League picks</div>
+      <h2 style={{fontSize:24,marginTop:6,marginBottom:10}}>Unable to load picks</h2>
+      <p style={{color:C.muted,margin:0}}>{error}</p>
+    </div>
+  );
+
+  if (events.length === 0) {
     return (
       <div className="card">
         <div className="eyebrow">League picks</div>
         <h2 style={{fontSize:24,marginTop:6,marginBottom:10}}>Nothing to show yet</h2>
-        <p style={{color:C.muted,marginTop:0}}>Everyone's picks stay hidden until a tournament starts, so no one can copy a pick before tee-off. Once the first event begins, picks appear here.</p>
+        <p style={{color:C.muted,marginTop:0}}>Everyone's picks stay hidden until a tournament is open or scored. Once an event is opened, picks appear here.</p>
       </div>
     );
   }
 
-  const t = SEED_TOURNAMENTS.find((x)=>x.id===tid);
-  const eventLocked = !isStarted(state, tid);
-
-  // count picks per golfer for the selected event (popularity)
+  const selectedEvent = events.find((event) => event.id === tid) || events[events.length - 1];
   const counts = {};
-  members.forEach((u)=>{ const p=(state.picks[u.email]||{})[tid]; if(p&&p.golfer){counts[p.golfer]=(counts[p.golfer]||0)+1;} });
+  members.forEach((member) => {
+    const pick = member.picks[selectedEvent.id];
+    if (pick?.golfer) counts[pick.golfer] = (counts[pick.golfer] || 0) + 1;
+  });
   const popular = Object.entries(counts).sort((a,b)=>b[1]-a[1]);
 
   return (
@@ -907,8 +1089,8 @@ function LeaguePicks({ state, me }) {
           <h2 style={{fontSize:24,marginTop:6,marginBottom:6}}>Who picked whom</h2>
           <p style={{fontSize:13,color:C.muted,marginTop:0}}>Picks unlock once a tournament starts. Only started events are listed.</p>
           <label style={{display:"block",margin:"12px 0"}}><span style={{fontSize:13,fontWeight:600}}>Tournament</span>
-            <select value={tid} onChange={(e)=>setTid(e.target.value)} style={{marginTop:4}}>
-              {started.map((x)=>(<option key={x.id} value={x.id}>{SEED_TOURNAMENTS.indexOf(x)+1}. {x.name}</option>))}
+            <select value={selectedEvent.id} onChange={(e)=>setTid(e.target.value)} style={{marginTop:4}}>
+              {events.map((event)=>(<option key={event.id} value={event.id}>{event.ordinal}. {event.name}</option>))}
             </select></label>
 
           {popular.length>0 && (
@@ -923,11 +1105,11 @@ function LeaguePicks({ state, me }) {
           <table>
             <thead><tr><th>Player</th><th>Pick</th><th style={{textAlign:"right"}}>Points</th></tr></thead>
             <tbody>
-              {members.map((u)=>{const p=(state.picks[u.email]||{})[tid];return(
-                <tr key={u.email} style={u.email===me?{background:C.chip}:undefined}>
-                  <td style={{fontWeight:600}}>{u.name}{u.email===me?" (you)":""}</td>
-                  <td>{p&&p.golfer?p.golfer:<span style={{color:C.muted}}>no pick</span>}</td>
-                  <td style={{textAlign:"right"}}>{p&&p.points!==null?<strong>{p.points}</strong>:<span style={{color:C.muted}}>—</span>}</td>
+              {members.map((member)=>{const pick=member.picks[selectedEvent.id];return(
+                <tr key={member.email} style={member.email===me?{background:C.chip}:undefined}>
+                  <td style={{fontWeight:600}}>{member.name}{member.email===me?" (you)":""}</td>
+                  <td>{pick?.golfer || <span style={{color:C.muted}}>no pick</span>}</td>
+                  <td style={{textAlign:"right"}}>{pick && pick.points!==null?<strong>{pick.points}</strong>:<span style={{color:C.muted}}>—</span>}</td>
                 </tr>);})}
             </tbody>
           </table>
@@ -942,23 +1124,23 @@ function LeaguePicks({ state, me }) {
           <table style={{minWidth:760}}>
             <thead><tr>
               <th style={{position:"sticky",left:0,background:"#fff"}}>Player</th>
-              {started.map((x)=>(<th key={x.id} title={x.name}>{SEED_TOURNAMENTS.indexOf(x)+1}</th>))}
+              {events.map((event)=>(<th key={event.id} title={event.name}>{event.ordinal}</th>))}
               <th style={{textAlign:"right"}}>Total</th>
             </tr></thead>
             <tbody>
-              {members.map((u)=>{const mine=state.picks[u.email]||{};
-                const total=Object.values(mine).reduce((s,p)=>s+(p.points||0),0);
-                return(<tr key={u.email} style={u.email===me?{background:C.chip}:undefined}>
-                  <td style={{position:"sticky",left:0,background:u.email===me?C.chip:"#fff",fontWeight:600,whiteSpace:"nowrap"}}>{u.name}{u.email===me?" (you)":""}</td>
-                  {started.map((x)=>{const p=mine[x.id];return(
-                    <td key={x.id} style={{fontSize:12,whiteSpace:"nowrap"}}>
-                      {p&&p.golfer?<span>{p.golfer}{p.points!==null?<span style={{color:C.muted}}> · {p.points}</span>:""}</span>:<span style={{color:C.line}}>—</span>}
+              {members.map((member)=>{
+                const total=Object.values(member.picks).reduce((sum,pick)=>sum+(pick.points||0),0);
+                return(<tr key={member.email} style={member.email===me?{background:C.chip}:undefined}>
+                  <td style={{position:"sticky",left:0,background:member.email===me?C.chip:"#fff",fontWeight:600,whiteSpace:"nowrap"}}>{member.name}{member.email===me?" (you)":""}</td>
+                  {events.map((event)=>{const pick=member.picks[event.id];return(
+                    <td key={event.id} style={{fontSize:12,whiteSpace:"nowrap"}}>
+                      {pick?.golfer?<span>{pick.golfer}{pick.points!==null?<span style={{color:C.muted}}> · {pick.points}</span>:""}</span>:<span style={{color:C.line}}>—</span>}
                     </td>);})}
                   <td style={{textAlign:"right",fontWeight:700}}>{total}</td>
                 </tr>);})}
             </tbody>
           </table>
-          <p style={{fontSize:12,color:C.muted,marginTop:10}}>Tip: hover a column number to see the tournament name. Showing {started.length} of {SEED_TOURNAMENTS.length} events.</p>
+          <p style={{fontSize:12,color:C.muted,marginTop:10}}>Tip: hover a column number to see the tournament name. Showing {events.length} visible events.</p>
         </div>
       )}
     </div>
@@ -970,25 +1152,72 @@ function Admin({ state, update }) {
   return (
     <div>
       <div style={{display:"flex",gap:6,marginBottom:16,flexWrap:"wrap"}}>
-        {[["score","Score a tournament"],["open","Open/close picks"],["picks","Edit picks"],["golfers","Golfer pool"],["season","New Season"],["reset","Reset data"]].map(([k,l])=>(
-          <button key={k} onClick={()=>setSection(k)} className={section===k?"btn":"btn ghost"}>{l}</button>))}
+        {[ ["score","Score a tournament"],["open","Open/close picks"],["picks","Edit picks"],["golfers","Golfer pool"],["schedule","League schedule"],["enrollment","Season enrollment"],["season","New Season"],["reset","Reset data"] ].map(([k,l])=>(
+          <button key={k} onClick={()=>setSection(k)} className={section===k?"btn":"btn ghost"}>{l}</button>
+        ))}
       </div>
-      {section==="score"&&<ScoreTool state={state} update={update} />}
-      {section==="open"&&<OpenPicks state={state} update={update} />}
-      {section==="picks"&&<EditPicks state={state} update={update} />}
-      {section==="golfers"&&<GolferPool state={state} update={update} />}
-      {section==="season"&&<NewSeasonTool state={state} update={update} />}
+      {section==="score"&&<ScoreTool />}
+      {section==="open"&&<OpenPicks />}
+      {section==="picks"&&<EditPicks />}
+      {section==="golfers"&&<GolferPool />}
+      {section==="schedule"&&<ScheduleTool />}
+      {section==="enrollment"&&<EnrollmentTool />}
+      {section==="season"&&<NewSeasonTool />}
       {section==="reset"&&<MigrationTool state={state} />}
     </div>
   );
 }
 
-function OpenPicks({ state, update }) {
-  const toggle = async (tid) => {
-    const cur = { ...(state.startedTournaments || {}) };
-    if (cur[tid]) delete cur[tid]; else cur[tid] = true;
-    await update({ ...state, startedTournaments: cur });
+function OpenPicks() {
+  const [tournaments, setTournaments] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState(null);
+  const [error, setError] = useState("");
+
+  const loadTournaments = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const { data: season, error: seasonError } = await supabase
+        .from("seasons").select("id").eq("year", CURRENT_SEASON_YEAR).single();
+      if (seasonError) throw seasonError;
+      const { data, error: tournamentError } = await supabase
+        .from("tournaments")
+        .select("id, ordinal, name, picks_open, scored")
+        .eq("season_id", season.id)
+        .order("ordinal");
+      if (tournamentError) throw tournamentError;
+      setTournaments(data || []);
+    } catch (loadError) {
+      setError(loadError.message || "Unable to load tournaments.");
+    } finally {
+      setLoading(false);
+    }
   };
+
+  useEffect(() => { loadTournaments(); }, []);
+
+  const toggle = async (tournament) => {
+    if (tournament.scored) return;
+    setBusyId(tournament.id);
+    setError("");
+    try {
+      const { data, error: updateError } = await supabase
+        .from("tournaments")
+        .update({ picks_open: !tournament.picks_open })
+        .eq("id", tournament.id)
+        .select("id, ordinal, name, picks_open, scored")
+        .single();
+      if (updateError) throw updateError;
+      setTournaments((current) => current.map((item) => item.id === data.id ? data : item));
+    } catch (updateError) {
+      setError(updateError.message || "Unable to update tournament visibility.");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  if (loading) return <div className="card"><p style={{color:C.muted}}>Loading tournament visibility...</p></div>;
   return (
     <div className="card">
       <div className="eyebrow">Pick visibility</div>
@@ -997,52 +1226,71 @@ function OpenPicks({ state, update }) {
       <table>
         <thead><tr><th>Tournament</th><th style={{textAlign:"center"}}>Picks visible?</th><th style={{textAlign:"right"}}>Action</th></tr></thead>
         <tbody>
-          {SEED_TOURNAMENTS.map((t)=>{const open=isStarted(state,t.id);
-            const scored=Object.values(state.picks).some((mp)=>mp[t.id]&&mp[t.id].points!==null);
-            return(<tr key={t.id}>
-              <td>{SEED_TOURNAMENTS.indexOf(t)+1}. {t.name}</td>
-              <td style={{textAlign:"center"}}>{open?<span style={{color:C.fairway,fontWeight:600}}>Open</span>:<span style={{color:C.muted}}>Closed</span>}</td>
+          {tournaments.map((tournament)=>{
+            return(<tr key={tournament.id}>
+              <td>{tournament.ordinal}. {tournament.name}</td>
+              <td style={{textAlign:"center"}}>{tournament.picks_open||tournament.scored?<span style={{color:C.fairway,fontWeight:600}}>Open</span>:<span style={{color:C.muted}}>Closed</span>}</td>
               <td style={{textAlign:"right"}}>
-                {scored ? <span style={{fontSize:12,color:C.muted}}>locked (scored)</span>
-                  : <button className={open?"btn ghost":"btn"} style={{padding:"6px 12px"}} onClick={()=>toggle(t.id)}>{open?"Close picks":"Open picks"}</button>}
+                {tournament.scored ? <span style={{fontSize:12,color:C.muted}}>locked (scored)</span>
+                  : <button className={tournament.picks_open?"btn ghost":"btn"} style={{padding:"6px 12px"}} onClick={()=>toggle(tournament)} disabled={busyId===tournament.id}>{busyId===tournament.id?"Saving...":(tournament.picks_open?"Close picks":"Open picks")}</button>}
               </td></tr>);})}
         </tbody>
       </table>
+      {error && <p style={{color:C.flag,fontSize:13,marginBottom:0}}>{error}</p>}
     </div>
   );
 }
 
-function ScoreTool({ state, update }) {
-  const firstUnscored = SEED_TOURNAMENTS.find((t)=>{
-    return Object.values(state.picks).some((mp)=>mp[t.id]&&mp[t.id].points===null);
-  }) || SEED_TOURNAMENTS.find((t)=>t.espnId) || SEED_TOURNAMENTS[14];
-  const [tid,setTid]=useState(firstUnscored.id);
-  const [url,setUrl]=useState(""); const [raw,setRaw]=useState("");
-  const [preview,setPreview]=useState(null); const [note,setNote]=useState("");
-  const t=SEED_TOURNAMENTS.find((x)=>x.id===tid);
-  const resolvedId = espnIdFromUrl(url) || t.espnId;
-  const liveLink = resolvedId ? `https://www.espn.com/golf/leaderboard/_/tournamentId/${resolvedId}` : "";
+function ScoreTool() {
+  const [tournaments,setTournaments]=useState([]); const [entries,setEntries]=useState([]);
+  const [tid,setTid]=useState(""); const [url,setUrl]=useState(""); const [raw,setRaw]=useState("");
+  const [preview,setPreview]=useState(null); const [note,setNote]=useState(""); const [loading,setLoading]=useState(true); const [saving,setSaving]=useState(false);
 
+  useEffect(()=>{
+    (async()=>{
+      try {
+        const {data:season,error:seasonError}=await supabase.from("seasons").select("id").eq("year",CURRENT_SEASON_YEAR).single();
+        if(seasonError) throw seasonError;
+        const [tournamentResult,entryResult]=await Promise.all([
+          supabase.from("tournaments").select("id, ordinal, name, espn_event_id, scored").eq("season_id",season.id).order("ordinal"),
+          supabase.from("season_entries").select("id, profiles(name, email), picks(tournament_id, golfer_name, points)").eq("season_id",season.id).eq("status","active")
+        ]);
+        if(tournamentResult.error) throw tournamentResult.error;
+        if(entryResult.error) throw entryResult.error;
+        setTournaments(tournamentResult.data||[]); setEntries(entryResult.data||[]); setTid(tournamentResult.data?.[0]?.id||"");
+      } catch(error) { setNote(`❌ ${error.message}`); }
+      finally { setLoading(false); }
+    })();
+  },[]);
+
+  const t=tournaments.find((x)=>x.id===tid); const resolvedId=espnIdFromUrl(url)||t?.espn_event_id||"";
+  const liveLink=resolvedId?`https://www.espn.com/golf/leaderboard/_/tournamentId/${resolvedId}`:"";
   const build=()=>{
     const table=parseEspnResults(raw); const count=Object.keys(table).length;
     if(!count){setNote("Couldn't read any rows. Paste the leaderboard rows including the FEDEX PTS column.");setPreview(null);return;}
     const results=[];
-    Object.values(state.users).forEach((u)=>{
-      const pick=(state.picks[u.email]||{})[tid]; if(!pick||!pick.golfer) return;
-      const pts=matchPoints(pick.golfer,table);
-      results.push({email:u.email,name:u.name,golfer:pick.golfer,pts,matched:pts!==null});
+    entries.forEach((entry)=>{
+      const profile=Array.isArray(entry.profiles)?entry.profiles[0]:entry.profiles;
+      const pick=(entry.picks||[]).find((item)=>item.tournament_id===tid); if(!pick?.golfer_name)return;
+      const pts=matchPoints(pick.golfer_name,table);
+      results.push({entryId:entry.id,email:profile?.email,name:profile?.name,golfer:pick.golfer_name,pts,matched:pts!==null});
     });
-    setPreview(results);
-    setNote(`Parsed ${count} golfers from ESPN. ${results.filter((r)=>!r.matched).length} pick(s) need a manual number below (highlighted).`);
+    setPreview(results); setNote(`Parsed ${count} golfers from ESPN. ${results.filter((r)=>!r.matched).length} pick(s) need a manual number below (highlighted).`);
   };
-  const apply=async()=>{ if(!preview) return;
-    const picks={...state.picks};
-    preview.forEach((r)=>{const mine={...(picks[r.email]||{})};mine[tid]={golfer:r.golfer,points:r.pts===null?0:r.pts};picks[r.email]=mine;});
-    await update({...state,picks}); setNote("Scores applied. Check the leaderboard."); setPreview(null); setRaw("");
+  const apply=async()=>{if(!preview||!t||preview.some((r)=>r.pts===null))return;setSaving(true);
+    try {
+      const {error:pickError}=await supabase.from("picks").upsert(preview.map((r)=>({entry_id:r.entryId,tournament_id:tid,golfer_name:r.golfer,points:r.pts})),{onConflict:"entry_id, tournament_id"});
+      if(pickError)throw pickError;
+      const {error:tournamentError}=await supabase.from("tournaments").update({scored:true,picks_open:true}).eq("id",tid);
+      if(tournamentError)throw tournamentError;
+      setNote("Scores applied to Supabase. The tournament is now marked scored.");setPreview(null);setRaw("");
+    } catch(error){setNote(`❌ ${error.message}`);} finally{setSaving(false);}
   };
   const setManual=(email,val)=>setPreview(preview.map((r)=>r.email===email?{...r,pts:val===""?null:parseInt(val,10),matched:val!==""}:r));
+  const pickedCount=entries.reduce((count,entry)=>count+(entry.picks||[]).some((pick)=>pick.tournament_id===tid)?1:0);
 
-  const pickedCount = Object.values(state.users).filter((u)=>(state.picks[u.email]||{})[tid]&&(state.picks[u.email]||{})[tid].golfer).length;
+  if(loading)return <div className="card"><p style={{color:C.muted}}>Loading scoring data...</p></div>;
+  if(!t)return <div className="card"><p style={{color:C.muted}}>No tournaments are available for scoring.</p></div>;
 
   return (
     <div className="card">
@@ -1050,7 +1298,7 @@ function ScoreTool({ state, update }) {
       <h2 style={{fontSize:22,marginTop:6}}>Score: {t.name}</h2>
       <label style={{display:"block",margin:"12px 0"}}><span style={{fontSize:13,fontWeight:600}}>Tournament</span>
         <select value={tid} onChange={(e)=>{setTid(e.target.value);setPreview(null);}} style={{marginTop:4}}>
-          {SEED_TOURNAMENTS.map((x,i)=><option key={x.id} value={x.id}>{i+1}. {x.name}</option>)}
+          {tournaments.map((x)=><option key={x.id} value={x.id}>{x.ordinal}. {x.name}{x.scored?"  ✓ scored":""}</option>)}
         </select></label>
       <p style={{fontSize:13,color:C.muted,marginTop:0}}>{pickedCount} member(s) have a pick for this event.</p>
 
@@ -1063,7 +1311,7 @@ function ScoreTool({ state, update }) {
       <textarea rows={7} value={raw} onChange={(e)=>setRaw(e.target.value)} placeholder="Paste the ESPN leaderboard rows here…" />
       <div style={{display:"flex",gap:8,marginTop:12}}>
         <button className="btn" onClick={build}>Preview scores</button>
-        {preview && <button className="btn warn" onClick={apply}>Apply to leaderboard</button>}
+        {preview && <button className="btn warn" onClick={apply} disabled={saving||preview.some((r)=>r.pts===null)}>{saving?"Saving...":"Apply to leaderboard"}</button>}
       </div>
       {note && <p style={{fontSize:13,color:C.muted,marginTop:12}}>{note}</p>}
       {preview && (
@@ -1083,57 +1331,83 @@ function ScoreTool({ state, update }) {
   );
 }
 
-function EditPicks({ state, update }) {
-  const [email,setEmail]=useState(Object.values(state.users).sort((a,b)=>a.name.localeCompare(b.name))[0].email);
-  const mine=state.picks[email]||{}; const used=usedGolfers(state,email);
-  const setPick=async(tid,golfer)=>{const cur=mine[tid]||{points:null};
-    const picks={...state.picks,[email]:{...mine,[tid]:{...cur,golfer}}};
-    if(!golfer){const m={...mine};delete m[tid];picks[email]=m;}
-    await update({...state,picks});};
-  const setPts=async(tid,val)=>{const cur=mine[tid];if(!cur)return;
-    const picks={...state.picks,[email]:{...mine,[tid]:{...cur,points:val===""?null:parseInt(val,10)}}};
-    await update({...state,picks});};
+function EditPicks() {
+  const [members,setMembers]=useState([]); const [tournaments,setTournaments]=useState([]); const [golfers,setGolfers]=useState([]);
+  const [email,setEmail]=useState(""); const [picks,setPicks]=useState({}); const [loading,setLoading]=useState(true); const [error,setError]=useState("");
+  const load=async()=>{
+    setLoading(true);setError("");
+    try {
+      const {data:season,error:seasonError}=await supabase.from("seasons").select("id").eq("year",CURRENT_SEASON_YEAR).single();if(seasonError)throw seasonError;
+      const [tournamentResult,entryResult,golferResult]=await Promise.all([
+        supabase.from("tournaments").select("id, ordinal, name").eq("season_id",season.id).order("ordinal"),
+        supabase.from("season_entries").select("id, profiles(name, email), picks(tournament_id, golfer_name, points)").eq("season_id",season.id).eq("status","active"),
+        supabase.from("golfers").select("name").eq("active",true).order("name")
+      ]);
+      if(tournamentResult.error)throw tournamentResult.error;if(entryResult.error)throw entryResult.error;if(golferResult.error)throw golferResult.error;
+      const nextMembers=(entryResult.data||[]).map((entry)=>{const profile=Array.isArray(entry.profiles)?entry.profiles[0]:entry.profiles;return {...entry,email:String(profile?.email||"").toLowerCase(),name:profile?.name||profile?.email||""};}).filter((entry)=>entry.email).sort((a,b)=>a.name.localeCompare(b.name));
+      setTournaments(tournamentResult.data||[]);setMembers(nextMembers);setGolfers((golferResult.data||[]).map((g)=>g.name));
+      setEmail((current)=>nextMembers.some((member)=>member.email===current)?current:nextMembers[0]?.email||"");
+    } catch(loadError){setError(loadError.message||"Unable to load member picks.");} finally{setLoading(false);}
+  };
+  useEffect(()=>{load();},[]);
+  const member=members.find((item)=>item.email===email); const mine=member?.picks||[];
+  const byTournament={};mine.forEach((pick)=>{byTournament[pick.tournament_id]=pick;});
+  const used=new Set(mine.map((pick)=>pick.golfer_name).filter(Boolean));
+  const savePick=async(tournamentId,golfer)=>{
+    if(!member)return;
+    try {
+      if(!golfer){const {error:deleteError}=await supabase.from("picks").delete().eq("entry_id",member.id).eq("tournament_id",tournamentId);if(deleteError)throw deleteError;}
+      else {const current=byTournament[tournamentId];const {error:saveError}=await supabase.from("picks").upsert({entry_id:member.id,tournament_id:tournamentId,golfer_name:golfer,points:current?.points??null},{onConflict:"entry_id, tournament_id"});if(saveError)throw saveError;}
+      await load();
+    } catch(saveError){setError(saveError.message||"Unable to save pick override.");}
+  };
+  const setPts=async(tournamentId,val)=>{if(!member)return;const current=byTournament[tournamentId];if(!current)return;try{const {error:saveError}=await supabase.from("picks").update({points:val===""?null:parseInt(val,10)}).eq("entry_id",member.id).eq("tournament_id",tournamentId);if(saveError)throw saveError;await load();}catch(saveError){setError(saveError.message||"Unable to save points.");}};
+  if(loading)return <div className="card"><p style={{color:C.muted}}>Loading member picks...</p></div>;
+  if(!member)return <div className="card"><p style={{color:C.muted}}>No active league members found.</p></div>;
   return (
     <div className="card">
       <div className="eyebrow">Manual override</div>
       <h2 style={{fontSize:22,marginTop:6,marginBottom:12}}>Edit a player's picks</h2>
       <label style={{display:"block",marginBottom:14}}><span style={{fontSize:13,fontWeight:600}}>League member</span>
         <select value={email} onChange={(e)=>setEmail(e.target.value)} style={{marginTop:4}}>
-          {Object.values(state.users).sort((a,b)=>a.name.localeCompare(b.name)).map((u)=><option key={u.email} value={u.email}>{u.name}</option>)}
+          {members.map((u)=><option key={u.email} value={u.email}>{u.name}</option>)}
         </select></label>
       <table>
         <thead><tr><th>Tournament</th><th>Golfer</th><th style={{textAlign:"right"}}>Points</th></tr></thead>
         <tbody>
-          {SEED_TOURNAMENTS.map((t)=>{const p=mine[t.id];
-            const opts=state.golfers.filter((g)=>!used.has(g)||(p&&p.golfer===g)).sort();
+          {tournaments.map((t)=>{const p=byTournament[t.id];
+            const opts=golfers.filter((g)=>!used.has(g)||(p&&p.golfer_name===g)).sort();
             return(<tr key={t.id}><td style={{fontSize:13}}>{t.name}</td>
-              <td><select value={p?p.golfer:""} onChange={(e)=>setPick(t.id,e.target.value)} style={{padding:"5px 8px"}}>
+              <td><select value={p?p.golfer_name:""} onChange={(e)=>savePick(t.id,e.target.value)} style={{padding:"5px 8px"}}>
                 <option value="">— none —</option>{opts.map((g)=><option key={g} value={g}>{g}</option>)}</select></td>
               <td style={{textAlign:"right",width:100}}>
                 <input value={p&&p.points!==null?p.points:""} onChange={(e)=>setPts(t.id,e.target.value)} disabled={!p} style={{textAlign:"right",padding:"5px 8px"}}/></td></tr>);})}
         </tbody>
       </table>
+      {error && <p style={{color:C.flag,fontSize:13}}>{error}</p>}
     </div>
   );
 }
 
-function GolferPool({ state, update }) {
+function GolferPool() {
   const [name,setName]=useState("");
-  const add=async()=>{const n=name.trim();if(!n||state.golfers.includes(n))return;
-    await update({...state,golfers:[...state.golfers,n].sort()});setName("");};
-  const remove=async(g)=>update({...state,golfers:state.golfers.filter((x)=>x!==g)});
+  const [golfers,setGolfers]=useState([]); const [error,setError]=useState("");
+  useEffect(()=>{supabase.from("golfers").select("espn_id, name, active").order("name").then(({data,error})=>{if(error)setError(error.message);else setGolfers(data||[]);});},[]);
+  const add=async()=>{const n=name.trim();if(!n||golfers.some((g)=>g.name===n))return;setError("");const {data,error}=await supabase.from("golfers").insert({name:n,espn_id:`manual-${crypto.randomUUID()}`,active:true}).select("espn_id, name, active").single();if(error)setError(error.message);else{setGolfers((current)=>[...current,data].sort((a,b)=>a.name.localeCompare(b.name)));setName("");}};
+  const remove=async(g)=>{const {error}=await supabase.from("golfers").update({active:false}).eq("espn_id",g.espn_id);if(error)setError(error.message);else setGolfers((current)=>current.filter((item)=>item.espn_id!==g.espn_id));};
   return (
     <div className="card">
       <div className="eyebrow">Field management</div>
-      <h2 style={{fontSize:22,marginTop:6,marginBottom:12}}>Golfer pool ({state.golfers.length})</h2>
+      <h2 style={{fontSize:22,marginTop:6,marginBottom:12}}>Golfer pool ({golfers.length})</h2>
       <div style={{display:"flex",gap:8,marginBottom:16}}>
         <input value={name} onChange={(e)=>setName(e.target.value)} placeholder="Add a golfer…" onKeyDown={(e)=>e.key==="Enter"&&add()}/>
         <button className="btn" onClick={add}>Add</button>
       </div>
       <div style={{display:"flex",flexWrap:"wrap",gap:6,maxHeight:460,overflow:"auto"}}>
-        {state.golfers.map((g)=>(<span key={g} style={{fontSize:13,background:C.sand,borderRadius:20,padding:"5px 10px 5px 12px",display:"inline-flex",alignItems:"center",gap:6}}>
-          {g}<button onClick={()=>remove(g)} style={{border:"none",background:"none",color:C.flag,fontWeight:700,fontSize:15,lineHeight:1,padding:0}}>×</button></span>))}
+        {golfers.map((g)=>(<span key={g.espn_id} style={{fontSize:13,background:C.sand,borderRadius:20,padding:"5px 10px 5px 12px",display:"inline-flex",alignItems:"center",gap:6}}>
+          {g.name}<button onClick={()=>remove(g)} style={{border:"none",background:"none",color:C.flag,fontWeight:700,fontSize:15,lineHeight:1,padding:0}}>×</button></span>))}
       </div>
+      {error && <p style={{color:C.flag,fontSize:13}}>{error}</p>}
     </div>
   );
 }
@@ -1151,12 +1425,67 @@ function ResetTool({ update }) {
     </div>
   );
 }
-function NewSeasonTool({ state, update }) {
+function ScheduleTool() {
+  const [tournaments,setTournaments]=useState([]); const [loading,setLoading]=useState(true); const [saving,setSaving]=useState(null); const [error,setError]=useState("");
+  useEffect(()=>{
+    (async()=>{
+      try {
+        const {data:season,error:seasonError}=await supabase.from("seasons").select("id").eq("year",CURRENT_SEASON_YEAR).single();if(seasonError)throw seasonError;
+        const {data,error:queryError}=await supabase.from("tournaments").select("id, ordinal, name, course, date_label, espn_event_id").eq("season_id",season.id).order("ordinal");if(queryError)throw queryError;setTournaments(data||[]);
+      } catch(queryError){setError(queryError.message||"Unable to load the schedule.");}finally{setLoading(false);}
+    })();
+  },[]);
+  const change=(id,field,value)=>setTournaments((current)=>current.map((item)=>item.id===id?{...item,[field]:value}:item));
+  const save=async(tournament)=>{setSaving(tournament.id);setError("");try{const {data,error:saveError}=await supabase.from("tournaments").update({name:tournament.name,course:tournament.course,date_label:tournament.date_label,espn_event_id:tournament.espn_event_id||null}).eq("id",tournament.id).select("id, ordinal, name, course, date_label, espn_event_id").single();if(saveError)throw saveError;setTournaments((current)=>current.map((item)=>item.id===data.id?data:item));}catch(saveError){setError(saveError.message||"Unable to save the schedule.");}finally{setSaving(null);}};
+  if(loading)return <div className="card"><p style={{color:C.muted}}>Loading league schedule...</p></div>;
+  return <div className="card"><div className="eyebrow">Schedule management</div><h2 style={{fontSize:22,marginTop:6,marginBottom:12}}>Edit the 2026 schedule</h2>
+    {tournaments.map((tournament)=><div key={tournament.id} style={{borderTop:"1px solid "+C.line,padding:"12px 0",display:"grid",gridTemplateColumns:"42px 1.4fr 1fr 1fr 1fr auto",gap:8,alignItems:"end"}}>
+      <strong>{tournament.ordinal}</strong>
+      {[['name','Name'],['course','Course'],['date_label','Date'],['espn_event_id','ESPN ID']].map(([field,label])=><label key={field}><span style={{fontSize:11,fontWeight:600}}>{label}</span><input value={tournament[field]||""} onChange={(e)=>change(tournament.id,field,e.target.value)} style={{marginTop:3,padding:"7px 8px"}}/></label>)}
+      <button className="btn" onClick={()=>save(tournament)} disabled={saving===tournament.id}>{saving===tournament.id?"Saving...":"Save"}</button>
+    </div>)}
+    {error&&<p style={{color:C.flag,fontSize:13}}>{error}</p>}
+  </div>;
+}
+
+function EnrollmentTool() {
+  const [seasons,setSeasons]=useState([]); const [selectedId,setSelectedId]=useState("");
+  const [profileCount,setProfileCount]=useState(0); const [entryCount,setEntryCount]=useState(0);
+  const [loading,setLoading]=useState(true); const [busy,setBusy]=useState(false); const [error,setError]=useState(""); const [note,setNote]=useState("");
+
+  const load=async()=>{
+    setLoading(true);setError("");
+    try {
+      const [seasonResult,profileResult]=await Promise.all([
+        supabase.from("seasons").select("id, year, name, status").order("year",{ascending:false}),
+        supabase.from("profiles").select("id")
+      ]);
+      if(seasonResult.error)throw seasonResult.error;if(profileResult.error)throw profileResult.error;
+      setSeasons(seasonResult.data||[]);setProfileCount((profileResult.data||[]).length);
+      setSelectedId((current)=>(seasonResult.data||[]).some((season)=>season.id===current)?current:seasonResult.data?.[0]?.id||"");
+    } catch(loadError){setError(loadError.message||"Unable to load seasons.");} finally{setLoading(false);}
+  };
+  const loadEntries=async(seasonId)=>{if(!seasonId)return;const {count,error:entryError}=await supabase.from("season_entries").select("id",{count:"exact",head:true}).eq("season_id",seasonId).eq("status","active");if(entryError)setError(entryError.message);else setEntryCount(count||0);};
+  useEffect(()=>{load();},[]); useEffect(()=>{loadEntries(selectedId);},[selectedId]);
+  const selected=seasons.find((season)=>season.id===selectedId);
+  const updateStatus=async(status)=>{if(!selected)return;setBusy(true);setError("");setNote("");try{const {data,error:updateError}=await supabase.from("seasons").update({status}).eq("id",selected.id).select("id, year, name, status").single();if(updateError)throw updateError;setSeasons((current)=>current.map((season)=>season.id===data.id?data:season));setNote(status==="active"?"Enrollment is open for this season.":"Season returned to setup mode.");}catch(updateError){setError(updateError.message||"Unable to update enrollment status.");}finally{setBusy(false);}};
+  const enrollAll=async()=>{if(!selected)return;setBusy(true);setError("");setNote("");try{const {data:profiles,error:profileError}=await supabase.from("profiles").select("id");if(profileError)throw profileError;const {data:existing,error:entryError}=await supabase.from("season_entries").select("profile_id").eq("season_id",selected.id);if(entryError)throw entryError;const present=new Set((existing||[]).map((entry)=>entry.profile_id));const missing=(profiles||[]).filter((profile)=>!present.has(profile.id)).map((profile)=>({season_id:selected.id,profile_id:profile.id,status:"active"}));if(missing.length){const {error:insertError}=await supabase.from("season_entries").insert(missing);if(insertError)throw insertError;}await loadEntries(selected.id);setNote(`✅ ${missing.length || "All"} profiles enrolled in ${selected.name}.`);}catch(enrollError){setError(enrollError.message||"Unable to enroll profiles.");}finally{setBusy(false);}};
+  if(loading)return <div className="card"><p style={{color:C.muted}}>Loading season enrollment...</p></div>;
+  if(!selected)return <div className="card"><p style={{color:C.muted}}>Create a season before configuring enrollment.</p></div>;
+  return <div className="card"><div className="eyebrow">Season enrollment</div><h2 style={{fontSize:22,marginTop:6,marginBottom:10}}>Prepare the next season</h2>
+    <label style={{display:"block",marginBottom:14}}><span style={{fontSize:13,fontWeight:600}}>Season</span><select value={selectedId} onChange={(e)=>setSelectedId(e.target.value)} style={{marginTop:4}}>{seasons.map((season)=><option key={season.id} value={season.id}>{season.year} · {season.name} · {season.status}</option>)}</select></label>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(2,minmax(0,1fr))",gap:10,marginBottom:16}}><div style={{background:C.chip,padding:12,borderRadius:10}}><strong>{entryCount}</strong><div style={{fontSize:12,color:C.muted}}>active entries</div></div><div style={{background:C.chip,padding:12,borderRadius:10}}><strong>{profileCount}</strong><div style={{fontSize:12,color:C.muted}}>profiles available</div></div></div>
+    <p style={{fontSize:13,color:C.muted,marginTop:0}}>Draft keeps the season in setup mode. Active opens it for play. Enrolling all profiles is idempotent and does not alter prior-season entries or picks.</p>
+    <div style={{display:"flex",gap:8,flexWrap:"wrap"}}><button className="btn" onClick={enrollAll} disabled={busy}>Enroll all existing profiles</button><button className="btn ghost" onClick={()=>updateStatus("active")} disabled={busy||selected.status==="active"}>Open enrollment</button><button className="btn ghost" onClick={()=>updateStatus("draft")} disabled={busy||selected.status==="draft"}>Keep in setup</button></div>
+    {note&&<p style={{color:C.fairway,fontSize:13}}>{note}</p>}{error&&<p style={{color:C.flag,fontSize:13}}>{error}</p>}
+  </div>;
+}
+
+function NewSeasonTool() {
   const [year, setYear] = useState(new Date().getFullYear() + 1);
   const [name, setName] = useState(`${new Date().getFullYear() + 1} Season`);
   const [status, setStatus] = useState("");
 
-  // Auto-update the season name when the year changes for convenience
   const handleYearChange = (e) => {
     const val = e.target.value;
     setYear(val);
@@ -1165,9 +1494,29 @@ function NewSeasonTool({ state, update }) {
   };
 
   const createSeason = async () => {
-    // Note: This is a placeholder for the UI. 
-    // In our next steps, we will replace this line with the Supabase insert command!
-    setStatus(`✅ Successfully initialized the ${name}!`);
+    setStatus("");
+    try {
+      const { data, error } = await supabase
+        .from("seasons")
+        .insert({ year: Number(year), name: name.trim(), status: "draft" })
+        .select("id, year, name, status")
+        .single();
+      if (error) throw error;
+      const { error: scheduleError } = await supabase.from("tournaments").insert(
+        SEED_TOURNAMENTS.map((tournament, index) => ({
+          season_id: data.id,
+          ordinal: index + 1,
+          name: tournament.name,
+          course: tournament.course,
+          date_label: tournament.date,
+          espn_event_id: tournament.espnId || null
+        }))
+      );
+      if (scheduleError) throw scheduleError;
+      setStatus(`✅ Successfully initialized the ${data.name} (${data.status}) with ${SEED_TOURNAMENTS.length} schedule rows.`);
+    } catch (error) {
+      setStatus(`❌ ${error.message}`);
+    }
   };
 
   return (
