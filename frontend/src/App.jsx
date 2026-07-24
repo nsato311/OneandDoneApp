@@ -595,58 +595,42 @@ function Login({ onLogin, users = {} }) {
 function usedGolfers(state,email){const mine=state.picks[email]||{};return new Set(Object.values(mine).map((p)=>p.golfer).filter(Boolean));}
 
 function PickTab({ state, update, me }) {
-  // Access current user context from mapped states
-  const currentUserContext = state.users[me]; 
-  const mine = state.picks[me] || {}; 
-  const used = usedGolfers(state, me);
+  const mine=state.picks[me]||{}; const used=usedGolfers(state,me);
+  const firstOpen=SEED_TOURNAMENTS.find((t)=>!mine[t.id])||SEED_TOURNAMENTS[SEED_TOURNAMENTS.length-1];
+  const [tid,setTid]=useState(firstOpen.id); const [choice,setChoice]=useState("");
+  const t=SEED_TOURNAMENTS.find((x)=>x.id===tid); const existing=mine[tid];
+  const available=state.golfers.filter((g)=>!used.has(g)||(existing&&existing.golfer===g)).sort();
   
-  const firstOpen = SEED_TOURNAMENTS.find((t) => !mine[t.id]) || SEED_TOURNAMENTS[SEED_TOURNAMENTS.length - 1];
-  const [tid, setTid] = useState(firstOpen.id); 
-  const [choice, setChoice] = useState("");
-  const t = SEED_TOURNAMENTS.find((x) => x.id === tid); 
-  const existing = mine[tid];
-  const available = state.golfers.filter((g) => !used.has(g) || (existing && existing.golfer === g)).sort();
-
   const submit = async () => {
-    if (!choice || !currentUserContext) return;
+    if (!choice) return;
 
+    // 1. Maintain current app functionality (Local State)
+    const picks = { ...state.picks, [me]: { ...mine, [tid]: { golfer: choice, points: existing ? existing.points : null } } };
+    await update({ ...state, picks });
+
+    // 2. Safely push the pick to Supabase using the required entry_id
     try {
-      // Find the specific tournament UUID belonging to this season's schedule step
-      const ordNumber = parseInt(tid.replace("t", ""), 10);
-      const { data: tournament } = await supabase
-        .from("tournaments")
-        .select("id")
-        .eq("ordinal", ordNumber)
-        .single();
+      const { data: profile } = await supabase.from('profiles').select('id').eq('email', me).single();
+      if (profile) {
+        const { data: season } = await supabase.from('seasons').select('id').eq('year', 2026).single();
+        const { data: entry } = await supabase.from('season_entries').select('id').eq('profile_id', profile.id).eq('season_id', season.id).single();
+        
+        const ordinal = parseInt(tid.replace('t', ''), 10);
+        const { data: tourney } = await supabase.from('tournaments').select('id').eq('ordinal', ordinal).single();
 
-      // Upsert the row directly matching this user's season entry registration record
-      const { error } = await supabase
-        .from("picks")
-        .upsert({
-          entry_id: currentUserContext.entryId,
-          tournament_id: tournament.id,
-          golfer_name: choice,
-          points: existing ? existing.points : null
-        }, { onConflict: "entry_id, tournament_id" }); // Enforces single pick entry bounds
-
-      if (error) throw error;
-
-      // Update local state smoothly so the UI updates instantly without reloading
-      const picks = {
-        ...state.picks,
-        [me]: {
-          ...mine,
-          [tid]: { golfer: choice, points: existing ? existing.points : null }
+        if (entry && tourney) {
+          await supabase.from('picks').upsert({
+            entry_id: entry.id,
+            tournament_id: tourney.id,
+            golfer_name: choice
+          }, { onConflict: 'entry_id, tournament_id' });
         }
-      };
-      await update({ ...state, picks });
-      
-      setChoice("");
-      alert("✅ 801 One and Done Says Pick successfully saved");
-
+      }
     } catch (err) {
-      alert("❌ Failed to save pick: " + err.message);
+      console.error("Supabase sync issue:", err);
     }
+
+    setChoice("");
   };
 
   return (
@@ -1132,8 +1116,6 @@ function MigrationTool({ state }) {
         log("✅ Schedule uploaded!");
       }
 
-      // --- NEW PHASE 3 CODE BELOW ---
-
       // 5. Setup Profiles & Entries
       log("5️⃣ Syncing Profiles and Season Entries...");
       const { data: dbTournaments } = await supabase.from('tournaments').select('id, ordinal');
@@ -1145,7 +1127,7 @@ function MigrationTool({ state }) {
       const newProfiles = [];
       SEED_MEMBERS.forEach(m => {
         if (!profileMap.has(m.email)) {
-          const newId = crypto.randomUUID(); // Assign deterministic UUIDs for migration
+          const newId = crypto.randomUUID(); 
           newProfiles.push({ id: newId, name: m.name, email: m.email, is_admin: m.isAdmin });
           profileMap.set(m.email, newId);
         }
@@ -1222,4 +1204,23 @@ function MigrationTool({ state }) {
     }
     setLoading(false);
   };
+
+  return (
+    <div className="card">
+      <div className="eyebrow" style={{color: "#d94833"}}>One-Time Migration</div>
+      <h2 style={{fontSize:22,marginTop:6,marginBottom:10}}>Push Local Data to Supabase</h2>
+      <p style={{fontSize:13,color:"#666",marginTop:0}}>
+        This tool will safely transfer your hardcoded 2026 schedule and data to the cloud database.
+      </p>
+      <button className="btn" onClick={runMigration} disabled={loading} style={{background:"#d94833"}}>
+        {loading ? "Migrating..." : "Run Database Migration"}
+      </button>
+
+      {logs.length > 0 && (
+        <div style={{marginTop: 20, background: "#f1f3f5", padding: 16, borderRadius: 8, fontSize: 13, fontFamily: "monospace", color: "#333", whiteSpace: "pre-wrap", border: "1px solid #ddd"}}>
+          {logs.join('\n')}
+        </div>
+      )}
+    </div>
+  );
 }
