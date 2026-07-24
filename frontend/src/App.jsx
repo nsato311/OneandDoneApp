@@ -666,24 +666,70 @@ function PickTab({ state, update, me }) {
   );
 }
 
-function HistoryTab({ state, me }) {
-  const mine=state.picks[me]||{};
-  const total=Object.values(mine).reduce((s,p)=>s+(p.points||0),0);
-  const rows=SEED_TOURNAMENTS.filter((t)=>mine[t.id]);
+function HistoryTab({ me }) {
+  const [pickRows, setPickRows] = useState([]);
+  const [totalPts, setTotalPts] = useState(0);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const fetchHistory = async () => {
+      setLoading(true);
+      try {
+        // 1. Identify the user profile and active season
+        const { data: profile } = await supabase.from('profiles').select('id').eq('email', me).single();
+        const { data: season } = await supabase.from('seasons').select('id').eq('year', 2026).single();
+        
+        if (profile && season) {
+          // 2. Locate their specific season entry
+          const { data: entry } = await supabase.from('season_entries').select('id').eq('profile_id', profile.id).eq('season_id', season.id).single();
+          
+          if (entry) {
+            // 3. Fetch their picks and join tournament names/ordinals
+            const { data: picks, error } = await supabase
+              .from('picks')
+              .select(`
+                golfer_name,
+                points,
+                tournaments ( ordinal, name )
+              `)
+              .eq('entry_id', entry.id);
+
+            if (error) throw error;
+
+            // Sort chronologically by tournament ordinal
+            const sortedPicks = picks.sort((a, b) => a.tournaments.ordinal - b.tournaments.ordinal);
+            const total = sortedPicks.reduce((sum, p) => sum + (p.points || 0), 0);
+            
+            setPickRows(sortedPicks);
+            setTotalPts(total);
+          }
+        }
+      } catch (err) {
+        console.error("Error fetching history:", err);
+      }
+      setLoading(false);
+    };
+
+    fetchHistory();
+  }, [me]);
+
+  if (loading) return <div className="card"><p style={{color: C.muted}}>Loading history...</p></div>;
+
   return (
     <div className="card">
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",flexWrap:"wrap",gap:8}}>
         <div><div className="eyebrow">Your season</div><h2 style={{fontSize:24,marginTop:6}}>Pick history</h2></div>
-        <div style={{textAlign:"right"}}><div style={{fontSize:32,fontFamily:"'Bricolage Grotesque'",fontWeight:800,color:C.fairway}}>{total}</div>
+        <div style={{textAlign:"right"}}><div style={{fontSize:32,fontFamily:"'Bricolage Grotesque'",fontWeight:800,color:C.fairway}}>{totalPts}</div>
           <div style={{fontSize:12,color:C.muted}}>total points</div></div>
       </div>
       <table style={{marginTop:16}}>
         <thead><tr><th>#</th><th>Tournament</th><th>Your golfer</th><th style={{textAlign:"right"}}>Points</th></tr></thead>
         <tbody>
-          {rows.length===0&&<tr><td colSpan={4} style={{color:C.muted}}>No picks yet.</td></tr>}
-          {rows.map((t)=>{const p=mine[t.id];const idx=SEED_TOURNAMENTS.indexOf(t)+1;return(
-            <tr key={t.id}><td style={{color:C.muted}}>{idx}</td><td>{t.name}</td>
-              <td style={{fontWeight:600}}>{p.golfer||"—"}</td>
+          {pickRows.length===0&&<tr><td colSpan={4} style={{color:C.muted}}>No picks yet.</td></tr>}
+          {pickRows.map((p, idx)=>{
+            return(
+            <tr key={idx}><td style={{color:C.muted}}>{p.tournaments.ordinal}</td><td>{p.tournaments.name}</td>
+              <td style={{fontWeight:600}}>{p.golfer_name||"—"}</td>
               <td style={{textAlign:"right"}}>{p.points===null?<span style={{color:C.muted}}>pending</span>:<strong>{p.points}</strong>}</td></tr>);})}
         </tbody>
       </table>
@@ -700,8 +746,63 @@ function standings(state){
   rows.forEach((r,i)=>{if(r.total!==prev){rank=i+1;prev=r.total;}r.rank=rank;r.behind=leader-r.total;});
   return rows;
 }
-function Leaderboard({ state, me }) {
-  const rows=useMemo(()=>standings(state),[state]);
+function Leaderboard({ me }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const fetchLeaderboard = async () => {
+      setLoading(true);
+      try {
+        // 1. Identify the active season
+        const { data: season } = await supabase.from('seasons').select('id').eq('year', 2026).single();
+        if (!season) return;
+
+        // 2. Fetch all entries, joining profile names and pick points
+        const { data: entries, error } = await supabase
+          .from('season_entries')
+          .select(`
+            id,
+            profiles ( name, email ),
+            picks ( points )
+          `)
+          .eq('season_id', season.id);
+
+        if (error) throw error;
+
+        // 3. Aggregate points and format for display
+        const calculatedRows = entries.map(entry => {
+          const total = entry.picks.reduce((sum, p) => sum + (p.points || 0), 0);
+          return {
+            name: entry.profiles.name,
+            email: entry.profiles.email,
+            total,
+            made: entry.picks.length
+          };
+        });
+
+        // 4. Sort and apply ranks
+        calculatedRows.sort((a, b) => b.total - a.total);
+
+        let rank = 0, prev = null, leader = calculatedRows.length ? calculatedRows[0].total : 0;
+        calculatedRows.forEach((r, i) => {
+          if (r.total !== prev) { rank = i + 1; prev = r.total; }
+          r.rank = rank;
+          r.behind = leader - r.total;
+        });
+
+        setRows(calculatedRows);
+      } catch (err) {
+        console.error("Error fetching leaderboard:", err);
+      }
+      setLoading(false);
+    };
+
+    fetchLeaderboard();
+  }, []);
+
+  if (loading) return <div className="card"><p style={{color: C.muted}}>Loading leaderboard...</p></div>;
+
   return (
     <div className="card">
       <div className="eyebrow">Standings</div>
@@ -729,7 +830,6 @@ function Leaderboard({ state, me }) {
           </tbody>
         </table>
       </div>
-      
     </div>
   );
 }
