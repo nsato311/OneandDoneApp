@@ -1091,110 +1091,119 @@ function MigrationTool({ state }) {
   const runMigration = async () => {
     setLoading(true);
     setLogs([]); 
-    log("🚀 Resuming data migration for Phase 3...");
+    log("🚀 Resuming data migration...");
 
     try {
-      // 1. Get Active Season
-      log("1️⃣ Verifying 2026 Season...");
+      // 1. Get or Create Season
+      log("1️⃣ Syncing 2026 Season...");
       const { data: season, error: sErr } = await supabase
         .from('seasons')
-        .select('id')
-        .eq('year', 2026)
+        .upsert({ year: 2026, name: '2026 Season', status: 'active' }, { onConflict: 'year' })
+        .select()
         .single();
+        
       if (sErr) throw new Error("Season sync failed: " + sErr.message);
+      log("✅ Season ready! ID: " + season.id);
 
-      // 2. Map Tournaments
-      log("2️⃣ Fetching Schedule DB IDs...");
-      const { data: dbTournaments, error: tErr } = await supabase.from('tournaments').select('id, ordinal');
-      if (tErr) throw new Error("Tournaments fetch failed: " + tErr.message);
+      // 2. Read and Format Local Data
+      log("2️⃣ Formatting local schedule and golfers...");
+      const localGolfers = Object.entries(state.golfers || {}).map(([key, val]) => {
+        if (typeof val === 'string') return { espn_id: key, name: val };
+        return { espn_id: key, ...val };
+      });
       
-      const tourneyMap = {};
-      dbTournaments.forEach(t => tourneyMap[t.ordinal] = t.id);
+      const localTournaments = SEED_TOURNAMENTS;
+      log(`Prepared ${localTournaments.length} tournaments and ${localGolfers.length} golfers.`);
 
-      // 3. Push Profiles
-      log("3️⃣ Syncing Historical Profiles...");
-      const { data: existingProfiles, error: pErr1 } = await supabase.from('profiles').select('id, email');
-      if (pErr1) throw new Error("Profile fetch failed: " + pErr1.message);
-      
-      const existingEmails = new Set(existingProfiles.map(p => p.email));
-      const newProfiles = SEED_MEMBERS.filter(m => !existingEmails.has(m.email)).map(m => ({
-        id: crypto.randomUUID(),
-        name: m.name,
-        email: m.email,
-        is_admin: m.isAdmin
-      }));
-
-      if (newProfiles.length > 0) {
-        const { error: pErr2 } = await supabase.from('profiles').insert(newProfiles);
-        if (pErr2) throw new Error("Profile upload failed: " + pErr2.message);
+      // 3. Push Golfers
+      if (localGolfers.length > 0) {
+        log("3️⃣ Uploading Golfer Pool...");
+        const { error: gErr } = await supabase.from('golfers').upsert(localGolfers);
+        if (gErr) throw new Error("Golfer upload failed: " + gErr.message);
+        log("✅ Golfers uploaded!");
       }
 
-      const { data: allProfiles, error: pErr3 } = await supabase.from('profiles').select('id, email');
-      if (pErr3) throw pErr3;
+      // 4. Push Tournaments
+      if (localTournaments.length > 0) {
+        log("4️⃣ Uploading Schedule...");
+        const tourneysWithSeason = localTournaments.map(t => ({ ...t, season_id: season.id }));
+        const { error: tErr } = await supabase.from('tournaments').upsert(tourneysWithSeason);
+        if (tErr) throw new Error("Tournament upload failed: " + tErr.message);
+        log("✅ Schedule uploaded!");
+      }
 
-      // 4. Push Season Entries
-      log("4️⃣ Registering Members to 2026 Season...");
-      const entries = allProfiles.map(p => ({
-        season_id: season.id,
-        profile_id: p.id,
-        status: 'active'
-      }));
-      
-      const { data: allEntries, error: eErr } = await supabase
-        .from('season_entries')
-        .upsert(entries, { onConflict: 'season_id, profile_id' })
-        .select('id, profile_id');
-      if (eErr) throw new Error("Entries upload failed: " + eErr.message);
+      // --- NEW PHASE 3 CODE BELOW ---
 
-      const entryMap = {}; 
-      allEntries.forEach(e => {
-        const prof = allProfiles.find(p => p.id === e.profile_id);
-        if (prof) entryMap[prof.email] = e.id;
+      // 5. Setup Profiles & Entries
+      log("5️⃣ Syncing Profiles and Season Entries...");
+      const { data: dbTournaments } = await supabase.from('tournaments').select('id, ordinal');
+      const { data: dbGolfers } = await supabase.from('golfers').select('espn_id, name');
+
+      const { data: existingProfiles } = await supabase.from('profiles').select('id, email');
+      const profileMap = new Map(existingProfiles?.map(p => [p.email, p.id]));
+
+      const newProfiles = [];
+      SEED_MEMBERS.forEach(m => {
+        if (!profileMap.has(m.email)) {
+          const newId = crypto.randomUUID(); // Assign deterministic UUIDs for migration
+          newProfiles.push({ id: newId, name: m.name, email: m.email, is_admin: m.isAdmin });
+          profileMap.set(m.email, newId);
+        }
       });
 
-      // 5. Build and Push Historical Picks
-      log("5️⃣ Formatting Historical Picks...");
-      const { data: dbGolfers, error: gErr } = await supabase.from('golfers').select('espn_id, name, aliases');
-      if (gErr) throw new Error("Golfers fetch failed: " + gErr.message);
+      if (newProfiles.length > 0) {
+        const { error: pErr } = await supabase.from('profiles').insert(newProfiles);
+        if (pErr) throw new Error("Profile creation failed: " + pErr.message);
+      }
 
+      const { data: existingEntries } = await supabase.from('season_entries').select('id, profile_id').eq('season_id', season.id);
+      const entryMap = new Map(existingEntries?.map(e => [e.profile_id, e.id]));
+
+      const newEntries = [];
+      SEED_MEMBERS.forEach(m => {
+        const pid = profileMap.get(m.email);
+        if (!entryMap.has(pid)) {
+          newEntries.push({ season_id: season.id, profile_id: pid, status: 'active' });
+        }
+      });
+
+      if (newEntries.length > 0) {
+        const { data: insertedEntries, error: eErr } = await supabase.from('season_entries').insert(newEntries).select();
+        if (eErr) throw new Error("Entry creation failed: " + eErr.message);
+        insertedEntries?.forEach(e => entryMap.set(e.profile_id, e.id));
+      }
+
+      // 6. Push Historical Picks
+      log("6️⃣ Translating historical picks...");
       const picksToInsert = [];
       
-      Object.entries(SEED_PICKS).forEach(([email, memberPicks]) => {
-        const entryId = entryMap[email];
+      const tMap = {};
+      SEED_TOURNAMENTS.forEach((t, i) => {
+        const dbT = dbTournaments?.find(dt => dt.ordinal === i + 1);
+        if (dbT) tMap[t.id] = dbT.id;
+      });
+
+      const gMap = {};
+      dbGolfers?.forEach(g => { gMap[g.name] = g.espn_id; });
+      Object.entries(state.golfers || {}).forEach(([espn_id, data]) => {
+          const name = typeof data === 'string' ? data : data.name;
+          gMap[name] = espn_id; 
+      });
+
+      Object.entries(state.picks).forEach(([email, picks]) => {
+        const pid = profileMap.get(email);
+        const entryId = entryMap.get(pid);
         if (!entryId) return;
 
-        // TRACK PREVIOUS PICKS TO BYPASS DB UNIQUE CONSTRAINT ON DUPLICATES
-        const usedEspnIds = new Set();
+        Object.entries(picks).forEach(([localTid, pick]) => {
+          if (!pick.golfer) return;
+          const tourneyId = tMap[localTid];
 
-        Object.entries(memberPicks).forEach(([localTid, pick]) => {
-          if (!pick || !pick.golfer) return;
-          
-          const ordinal = parseInt(localTid.replace('t', ''), 10);
-          const dbTournamentId = tourneyMap[ordinal];
-          
-          const clean = pick.golfer.toLowerCase().trim();
-          let espnId = null;
-          
-          const found = dbGolfers.find(g => 
-            g.name.toLowerCase().trim() === clean || 
-            (g.aliases && g.aliases.some(a => a.toLowerCase().trim() === clean))
-          );
-          
-          if (found) {
-            // If they already picked this golfer, nullify the ID so it doesn't crash the database!
-            if (usedEspnIds.has(found.espn_id)) {
-              espnId = null; 
-            } else {
-              espnId = found.espn_id;
-              usedEspnIds.add(espnId);
-            }
-          }
-
-          if (dbTournamentId) {
+          if (tourneyId) {
             picksToInsert.push({
               entry_id: entryId,
-              tournament_id: dbTournamentId,
-              golfer_espn_id: espnId,
+              tournament_id: tourneyId,
+              golfer_espn_id: gMap[pick.golfer] || null,
               golfer_name: pick.golfer,
               points: pick.points
             });
@@ -1202,37 +1211,15 @@ function MigrationTool({ state }) {
         });
       });
 
-      log(`6️⃣ Pushing ${picksToInsert.length} picks to Supabase...`);
-      const chunkSize = 200;
-      for (let i = 0; i < picksToInsert.length; i += chunkSize) {
-        const chunk = picksToInsert.slice(i, i + chunkSize);
-        const { error: pickErr } = await supabase.from('picks').upsert(chunk, { onConflict: 'entry_id, tournament_id' });
-        if (pickErr) throw new Error(`Picks upload failed at chunk ${i}: ` + pickErr.message);
-      }
+      log(`Found ${picksToInsert.length} picks to migrate.`);
+      const { error: pickErr } = await supabase.from('picks').upsert(picksToInsert, { onConflict: 'entry_id, tournament_id' });
+      if (pickErr) throw new Error("Picks upload failed: " + pickErr.message);
 
-      log("✅ Phase 3 Complete! League picks are successfully migrated.");
+      log("🎉 Phase 3 Complete! Your historical data is safe in the cloud.");
+
     } catch (error) {
       log("❌ " + error.message);
     }
     setLoading(false);
   };
-
-  return (
-    <div className="card">
-      <div className="eyebrow" style={{color: "#d94833"}}>Phase 3 Migration</div>
-      <h2 style={{fontSize:22,marginTop:6,marginBottom:10}}>Push Historical Picks</h2>
-      <p style={{fontSize:13,color:"#666",marginTop:0}}>
-        This pushes member profiles, season entries, and the 2026 pick history to the cloud database.
-      </p>
-      <button className="btn" onClick={runMigration} disabled={loading} style={{background:"#d94833"}}>
-        {loading ? "Migrating..." : "Run Phase 3 Migration"}
-      </button>
-
-      {logs.length > 0 && (
-        <div style={{marginTop: 20, background: "#f1f3f5", padding: 16, borderRadius: 8, fontSize: 13, fontFamily: "monospace", color: "#333", whiteSpace: "pre-wrap", border: "1px solid #ddd"}}>
-          {logs.join('\n')}
-        </div>
-      )}
-    </div>
-  );
 }
