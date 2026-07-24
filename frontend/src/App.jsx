@@ -183,22 +183,29 @@ async function fetchLeagueData() {
     if (sErr) throw sErr;
 
     // 2. Fetch everything concurrently for speed
-    const [
-      { data: dbTournaments },
-      { data: dbGolfers },
-      { data: dbProfiles },
-      { data: dbPicks }
-    ] = await Promise.all([
+    const results = await Promise.all([
       supabase.from('tournaments').select('*').eq('season_id', season.id).order('ordinal'),
       supabase.from('golfers').select('*').order('name'),
       supabase.from('profiles').select('*'),
       supabase.from('picks').select('*, season_entries(profile_id)')
     ]);
 
+    const queryError = results.find(({ error }) => error)?.error;
+    if (queryError) throw queryError;
+
+    const [
+      { data: dbTournaments },
+      { data: dbGolfers },
+      { data: dbProfiles },
+      { data: dbPicks }
+    ] = results;
+
     // 3. Mold Profiles into the 'users' object
     const users = {};
     dbProfiles.forEach(p => {
-      users[p.email] = { name: p.name, email: p.email, isAdmin: p.is_admin, id: p.id };
+      const email = String(p.email || '').trim().toLowerCase();
+      if (!email) return;
+      users[email] = { name: p.name, email, isAdmin: p.is_admin, id: p.id };
     });
 
     // 4. Mold Golfers into a flat array
@@ -215,7 +222,10 @@ async function fetchLeagueData() {
 
     // 6. Mold Picks into the nested object
     const picks = {};
-    dbProfiles.forEach(p => picks[p.email] = {});
+    dbProfiles.forEach(p => {
+      const email = String(p.email || '').trim().toLowerCase();
+      if (email) picks[email] = {};
+    });
     
     dbPicks.forEach(p => {
       if (!p.season_entries) return;
@@ -224,7 +234,9 @@ async function fetchLeagueData() {
       
       const localTid = tourneyIdToLocalId[p.tournament_id];
       if (localTid) {
-        picks[profile.email][localTid] = {
+        const email = String(profile.email || '').trim().toLowerCase();
+        if (!picks[email]) picks[email] = {};
+        picks[email][localTid] = {
           golfer: p.golfer_name,
           points: p.points
         };
@@ -340,7 +352,21 @@ export default function App() {
 
     (async () => {
       setBooting(true);
-      let s = await fetchLeagueData();
+      const { data: { session } } = await supabase.auth.getSession();
+      let s;
+
+      if (session?.user) {
+        const email = session.user.email || "";
+        await linkProfileToSupabase({
+          user: session.user,
+          email,
+          name: session.user.user_metadata?.name || email.split('@')[0]
+        });
+        s = await fetchLeagueData();
+        if (active) setMe(email.trim().toLowerCase());
+      } else {
+        s = await fetchLeagueData();
+      }
 
       if (!s) {
         console.warn("Falling back to local seed data.");
@@ -362,8 +388,11 @@ export default function App() {
     setState(next);
   };
 
-  const handleLogin = (email) => {
-    setMe(email);
+  const handleLogin = async (email) => {
+    const normalizedEmail = String(email || "").trim().toLowerCase();
+    const cloudState = await fetchLeagueData();
+    if (cloudState) setState(cloudState);
+    setMe(normalizedEmail);
     setTab("pick");
   };
 
@@ -405,7 +434,7 @@ export default function App() {
     );
   }
 
-  const currentUser = state.users[me] || { name: me, email: me, isAdmin: false };
+  const currentUser = state.users[String(me || "").trim().toLowerCase()] || { name: me, email: me, isAdmin: false };
 
   let content;
   if (tab === "history") {
