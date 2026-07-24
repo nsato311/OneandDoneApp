@@ -1107,11 +1107,22 @@ function MigrationTool({ state }) {
         log("✅ Golfers uploaded!");
       }
 
-      // 4. Push Tournaments
+      // 4. Push Tournaments (Fixed Schema Mapping)
       if (localTournaments.length > 0) {
         log("4️⃣ Uploading Schedule...");
-        const tourneysWithSeason = localTournaments.map(t => ({ ...t, season_id: season.id }));
-        const { error: tErr } = await supabase.from('tournaments').upsert(tourneysWithSeason);
+        const tourneysWithSeason = localTournaments.map((t, index) => ({
+          season_id: season.id,
+          ordinal: index + 1,
+          name: t.name,
+          course: t.course,
+          date_label: t.date,
+          espn_event_id: t.espnId || null
+        }));
+        
+        const { error: tErr } = await supabase
+          .from('tournaments')
+          .upsert(tourneysWithSeason, { onConflict: 'season_id, ordinal' });
+          
         if (tErr) throw new Error("Tournament upload failed: " + tErr.message);
         log("✅ Schedule uploaded!");
       }
@@ -1223,4 +1234,4 @@ function MigrationTool({ state }) {
       )}
     </div>
   );
-}
+} 
